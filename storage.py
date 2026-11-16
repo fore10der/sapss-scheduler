@@ -35,7 +35,51 @@ class Store:
             content TEXT NOT NULL, error TEXT);
         CREATE INDEX IF NOT EXISTS due_posts ON posts(status, due);
         ''')
+        self.db.executescript('''
+        CREATE TABLE IF NOT EXISTS assets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, source_chat TEXT NOT NULL,
+            source_ids TEXT NOT NULL, group_id TEXT, content TEXT,
+            status TEXT NOT NULL DEFAULT 'available', stamp TEXT,
+            dirty INTEGER NOT NULL DEFAULT 1, revision INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(source_chat, source_ids));
+        CREATE UNIQUE INDEX IF NOT EXISTS asset_groups ON assets(source_chat, group_id)
+            WHERE group_id IS NOT NULL;
+        ''')
+        self.db.executescript('''
+        CREATE TABLE IF NOT EXISTS asset_originals (
+            asset_id INTEGER PRIMARY KEY REFERENCES assets(id), original TEXT NOT NULL,
+            kind TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS status_notifications (
+            asset_id INTEGER NOT NULL REFERENCES assets(id), revision INTEGER NOT NULL,
+            state TEXT NOT NULL, message_id INTEGER, reported INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(asset_id, revision));
+        UPDATE status_notifications SET state='uncertain' WHERE state='sending';
+        ''')
+        if 'asset_id' not in [r[1] for r in self.db.execute('PRAGMA table_info(posts)')]:
+            self.db.execute('ALTER TABLE posts ADD COLUMN asset_id INTEGER REFERENCES assets(id)')
+        self.db.execute('CREATE UNIQUE INDEX IF NOT EXISTS active_asset ON posts(asset_id) WHERE asset_id IS NOT NULL')
+        self.db.executescript('''
+        CREATE TABLE IF NOT EXISTS asset_status_order (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_id INTEGER NOT NULL UNIQUE REFERENCES assets(id));
+        CREATE TRIGGER IF NOT EXISTS order_asset_status
+        AFTER UPDATE OF revision ON assets
+        WHEN NEW.revision != OLD.revision AND NEW.status IN ('pending','published')
+        BEGIN
+            DELETE FROM asset_status_order WHERE asset_id=NEW.id;
+            INSERT INTO asset_status_order(asset_id) VALUES(NEW.id);
+        END;
+        ''')
         with self.db:
+            # Legacy databases have no event sequence. Seed deterministically once;
+            # subsequent transitions use the trigger, independent of wall-clock changes.
+            self.db.execute('''INSERT INTO asset_status_order(asset_id)
+                SELECT a.id FROM assets a LEFT JOIN posts p ON p.asset_id=a.id
+                WHERE a.status IN ('pending','published') AND NOT EXISTS
+                    (SELECT 1 FROM asset_status_order o WHERE o.asset_id=a.id)
+                ORDER BY a.stamp,p.id,a.id''')
+            for row in self.db.execute("SELECT asset_id FROM posts WHERE status='sending'").fetchall():
+                self._asset_status(row['asset_id'], 'uncertain')
             self.db.execute("UPDATE posts SET status='uncertain', error='Process stopped during delivery' WHERE status='sending'")
 
     def _cleanup(self):
@@ -49,8 +93,16 @@ class Store:
             cur = self.db.execute('INSERT INTO schedules(chat_id,start,end) VALUES(?,?,?)',
                                   (str(chat_id), start.isoformat(), end.isoformat()))
             sid = cur.lastrowid
-            self.db.executemany('INSERT INTO posts(schedule_id,due,content) VALUES(?,?,?)',
-                                [(sid, t.isoformat(), json.dumps(p)) for t, p in zip(times, posts)])
+            for t, p in zip(times, posts):
+                aid = p.get('asset_id')
+                if aid is not None:
+                    changed = self.db.execute("UPDATE assets SET status='pending',stamp=?,dirty=1,revision=revision+1 WHERE id=? AND status='available' AND content IS NOT NULL",
+                                              (t.isoformat(), aid)).rowcount
+                    if not changed:
+                        raise ValueError('Asset is no longer available. Refresh the pool.')
+                    p = json.loads(self.db.execute('SELECT content FROM assets WHERE id=?', (aid,)).fetchone()[0])
+                self.db.execute('INSERT INTO posts(schedule_id,due,content,asset_id) VALUES(?,?,?,?)',
+                                (sid, t.isoformat(), json.dumps(p), aid))
         return sid
 
     def list_schedules(self):
@@ -69,6 +121,8 @@ class Store:
 
     def delete_schedule(self, schedule_id):
         with self.db:
+            for row in self.db.execute("SELECT asset_id,status FROM posts WHERE schedule_id=? AND status!='sending'", (schedule_id,)).fetchall():
+                self._asset_status(row['asset_id'], 'uncertain' if row['status'] == 'uncertain' else 'available')
             self.db.execute("DELETE FROM posts WHERE schedule_id=? AND status!='sending'", (schedule_id,))
             retained = self.db.execute('SELECT 1 FROM posts WHERE schedule_id=?', (schedule_id,)).fetchone() is not None
             self._cleanup()
@@ -79,6 +133,9 @@ class Store:
 
     def resolve(self, post_id, retry=False):
         with self.db:
+            row = self.db.execute("SELECT * FROM posts WHERE id=? AND status IN ('uncertain','failed')", (post_id,)).fetchone()
+            if row:
+                self._asset_status(row['asset_id'], 'pending' if retry else ('uncertain' if row['status'] == 'uncertain' else 'available'), row['due'] if retry else None)
             if retry:
                 self.db.execute("UPDATE posts SET status='pending',error=NULL WHERE id=? AND status IN ('uncertain','failed')", (post_id,))
             else:
@@ -95,12 +152,101 @@ class Store:
 
     def finish(self, post_id):
         with self.db:
+            row = self.db.execute("SELECT asset_id FROM posts WHERE id=? AND status='sending'", (post_id,)).fetchone()
+            if row:
+                self._asset_status(row['asset_id'], 'published', datetime.now(UTC).isoformat())
+                self.db.execute("UPDATE assets SET content=NULL WHERE id=?", (row['asset_id'],))
             self.db.execute("DELETE FROM posts WHERE id=? AND status='sending'", (post_id,))
             self._cleanup()
 
     def hold(self, post_id, status, error):
         with self.db:
+            row = self.db.execute('SELECT asset_id,due FROM posts WHERE id=?', (post_id,)).fetchone()
+            if row:
+                self._asset_status(row['asset_id'], status, row['due'] if status == 'pending' else None)
             self.db.execute('UPDATE posts SET status=?,error=? WHERE id=?', (status, str(error), post_id))
+
+    def _asset_status(self, asset_id, status, stamp=None):
+        self.db.execute('UPDATE assets SET status=?,stamp=?,dirty=1,revision=revision+1 WHERE id=?',
+                        (status, stamp, asset_id))
+
+    def add_asset(self, source_chat, source_ids, content, group_id=None):
+        with self.db:
+            cur = self.db.execute('INSERT OR IGNORE INTO assets(source_chat,source_ids,group_id,content) VALUES(?,?,?,?)',
+                                  (str(source_chat), json.dumps(source_ids), group_id, json.dumps(content)))
+            if cur.rowcount:
+
+                return cur.lastrowid
+        return None
+
+    def assets(self, status='available'):
+        return [dict(r) for r in self.db.execute('SELECT * FROM assets WHERE status=? ORDER BY id', (status,))]
+
+    def asset_from_source(self, source_chat, source_id):
+        matches = [dict(row) for row in self.db.execute(
+            'SELECT * FROM assets WHERE source_chat=?', (str(source_chat),))
+            if source_id in json.loads(row['source_ids'])]
+        if len(matches) > 1:
+            raise ValueError('Source matches multiple assets. Use Asset pool to select explicitly.')
+        return matches[0] if matches else None
+
+    def asset_content(self, asset_id):
+        row = self.db.execute("SELECT content FROM assets WHERE id=? AND status='available'", (asset_id,)).fetchone()
+        if not row or not row[0]:
+            raise ValueError('Asset is no longer available.')
+        return {**json.loads(row[0]), 'asset_id': asset_id}
+
+    def release_uncertain(self, asset_id):
+        with self.db:
+            self.db.execute("UPDATE assets SET status='available',stamp=NULL,dirty=1,revision=revision+1 WHERE id=? AND status='uncertain' AND NOT EXISTS (SELECT 1 FROM posts WHERE asset_id=assets.id)", (asset_id,))
+
+    def status_jobs(self):
+        return [dict(r) for r in self.db.execute('''SELECT a.* FROM assets a
+            LEFT JOIN asset_status_order o ON o.asset_id=a.id
+            WHERE a.dirty=1 AND NOT EXISTS (SELECT 1 FROM status_notifications n
+            WHERE n.asset_id=a.id AND n.revision=a.revision)
+            ORDER BY o.seq,a.id''')]
+
+    def claim_status(self, asset_id, revision):
+        with self.db:
+            return bool(self.db.execute('''INSERT OR IGNORE INTO status_notifications
+                (asset_id,revision,state) SELECT id,revision,'sending' FROM assets
+                WHERE id=? AND revision=? AND dirty=1''', (asset_id, revision)).rowcount)
+
+    def status_result(self, asset_id, revision, state, message_id=None):
+        with self.db:
+            if state == 'retry':
+                self.db.execute('DELETE FROM status_notifications WHERE asset_id=? AND revision=?',
+                                (asset_id, revision))
+            else:
+                self.db.execute('''UPDATE status_notifications SET state=?,message_id=?
+                    WHERE asset_id=? AND revision=?''', (state, message_id, asset_id, revision))
+                self.status_done(asset_id, revision)
+
+    def uncertain_notifications(self):
+        return [dict(r) for r in self.db.execute('''SELECT asset_id AS id,revision
+            FROM status_notifications WHERE state='uncertain' AND reported=0''')]
+
+    def notification_reported(self, asset_id, revision):
+        with self.db:
+            self.db.execute('UPDATE status_notifications SET reported=1 WHERE asset_id=? AND revision=?',
+                            (asset_id, revision))
+
+    def is_status_reply(self, chat_id, source_id, text):
+        # The claim exists before the HTTP send, including during update/result races.
+        import re
+        match = re.match(r'^\[pool-status #(\d+) r(\d+)\]\n', text or '')
+        if not match:
+            return False
+        row = self.db.execute('''SELECT a.source_ids FROM assets a
+            JOIN status_notifications n ON n.asset_id=a.id
+            WHERE a.source_chat=? AND a.id=? AND n.revision=?''',
+            (str(chat_id), int(match[1]), int(match[2]))).fetchone()
+        return bool(row and json.loads(row['source_ids'])[0] == source_id)
+
+    def status_done(self, asset_id, revision):
+        with self.db:
+            self.db.execute('UPDATE assets SET dirty=0 WHERE id=? AND revision=?', (asset_id, revision))
 
     def close(self):
         self.db.close()

@@ -9,6 +9,7 @@ data/
 *.db
 *.db-*
 .env.*
+!.env.example
 secrets/
 secrets.*
 *.pem

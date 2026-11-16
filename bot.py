@@ -23,6 +23,7 @@ from telegram import (
     InlineKeyboardMarkup,
     InputMediaPhoto,
     MessageEntity,
+    MessageOriginChannel,
     ReplyKeyboardMarkup,
 )
 from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
@@ -32,7 +33,7 @@ import storage
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
 MENU = ReplyKeyboardMarkup(
-    [["Create schedule", "View schedules"], ["Needs attention"]], resize_keyboard=True
+    [["Create schedule", "View schedules"], ["Needs attention", "Asset pool"]], resize_keyboard=True
 )
 
 
@@ -156,7 +157,8 @@ async def _album_flush(context, chat_id, draft, group_id):
         pending = draft["pending"].pop(group_id)
         # Sort by Telegram message ID rather than arrival order.
         pending["post"]["media"] = [item for _, item in sorted(pending["items"].items())]
-        await context.bot.send_message(chat_id, f"Accepted album: {len(pending['post']['media'])} photos.")
+        await context.bot.send_message(chat_id, f"Accepted album: {len(pending['post']['media'])} photos. "
+                                       'Standalone post, not linked to a pool asset. For pool tracking use Asset pool → Add to draft.')
         await _summary(context, chat_id)
     except asyncio.CancelledError:
         pass
@@ -258,6 +260,22 @@ async def _message(update, context):
     if text == "View schedules":
         await _list(context, chat_id)
         return
+    if text == "Asset pool":
+        store = context.application.bot_data['store']
+        available = store.assets()
+        await message.reply_text(f"Available assets: {len(available)}. Create a draft window first, then add multiple assets here.")
+        for asset in available:
+            content = store.asset_content(asset['id'])
+            metadata = f"Asset #{asset['id']} · {content['kind']} · {asset['status']}"
+            if content['kind'] == 'album':
+                metadata += f" · {len(content['media'])} photos"
+            draft = context.user_data.get('draft')
+            markup = (_keyboard([[("Add to draft", f"asset:{draft['key']}:{asset['id']}")]])
+                      if draft and 'end' in draft else None)
+            await message.reply_text(metadata, reply_markup=markup)
+        for asset in store.assets('uncertain'):
+            await message.reply_text(f"Asset #{asset['id']} is uncertain. Check the destination before reuse. Active queue entries must be dismissed first.", reply_markup=_keyboard([[("Review reuse risk", f"release:{asset['id']}")]]))
+        return
     if text == "Needs attention":
         await _attention(context, chat_id)
         return
@@ -284,6 +302,31 @@ async def _message(update, context):
             context.user_data["step"] = "posts"
             await message.reply_text("Send text, photos, or photo albums. Formatting and captions are preserved.")
             await _summary(context, chat_id)
+        return
+    origin = getattr(message, 'forward_origin', None)
+    pool_id = context.application.bot_data.get('pool_chat_id')
+    if isinstance(origin, MessageOriginChannel) and pool_id is not None and str(origin.chat.id) == str(pool_id):
+        store = context.application.bot_data['store']
+        try:
+            asset = store.asset_from_source(origin.chat.id, origin.message_id)
+            if asset is None:
+                raise ValueError('Pool source is not stored yet (or was never imported). Wait for album ingestion, then use Asset pool → Add to draft.')
+            aid = asset['id']
+            if any(post.get('asset_id') == aid for post in draft['posts']):
+                await message.reply_text(f"Asset #{aid} is already selected in this draft; not added again.")
+                return
+            storage.schedule_times(draft['start'], draft['end'], len(draft['posts']) + 1)
+            post = store.asset_content(aid)
+        except ValueError as exc:
+            await message.reply_text(f"Not added: {exc} Use Asset pool to review availability.")
+            return
+        draft['posts'].append(post)
+        detail = ' Full stored album selected, including all photos and original captions.' if post['kind'] == 'album' else ' Stored original content selected.'
+        await message.reply_text(f"Selected pool asset #{aid}.{detail} Use Preview to inspect it; Commit reserves it.")
+        await _summary(context, chat_id)
+        return
+    if origin is not None and getattr(origin, 'type', None) == 'hidden_user':
+        await message.reply_text('Not added: Telegram hid the forwarding source, so no pool asset can be identified safely. Use Asset pool → Add to draft for a pool asset, or send an original upload for a standalone post.')
         return
     if not (message.media_group_id and message.media_group_id in draft["pending"]):
         try:
@@ -322,7 +365,8 @@ async def _message(update, context):
         await message.reply_text("Please send text, a photo, or a photo album. This message was not added.")
         return
     draft["posts"].append(post)
-    await message.reply_text("Accepted text post." if post["kind"] == "text" else "Accepted photo post.")
+    await message.reply_text(("Accepted text post." if post["kind"] == "text" else "Accepted photo post.") +
+                             ' Standalone post, not linked to a pool asset. For pool tracking use Asset pool → Add to draft.')
     await _summary(context, chat_id)
 
 
@@ -333,6 +377,31 @@ async def _callback(update, context):
     parts = query.data.split(":")
     action = parts[0]
     store = context.application.bot_data["store"]
+    if action == 'asset':
+        draft = context.user_data.get('draft')
+        if not draft or draft['key'] != parts[1] or 'end' not in draft:
+            await context.bot.send_message(chat_id, 'This draft is no longer active or has no window.')
+            return
+        aid = int(parts[2])
+        if any(p.get('asset_id') == aid for p in draft['posts']):
+            await context.bot.send_message(chat_id, 'Already selected in this draft.')
+            return
+        try:
+            storage.schedule_times(draft['start'], draft['end'], len(draft['posts']) + 1)
+            draft['posts'].append(store.asset_content(aid))
+        except ValueError as exc:
+            await context.bot.send_message(chat_id, str(exc))
+            return
+        await _summary(context, chat_id)
+        return
+    if action in ('release', 'release_yes'):
+        aid = int(parts[1])
+        if action == 'release':
+            await context.bot.send_message(chat_id, 'This asset may already be published. Reusing it risks a duplicate. Confirm only after checking the destination.', reply_markup=_keyboard([[("Accept duplicate risk", f"release_yes:{aid}"), ("Keep blocked", 'noop')]]))
+        else:
+            store.release_uncertain(aid)
+            await context.bot.send_message(chat_id, 'Reuse confirmation recorded if no active queue entry remains. Refresh Asset pool.')
+        return
     if action == "draft":
         draft = context.user_data.get("draft")
         if not draft or str(draft["key"]) != parts[1]:
@@ -373,7 +442,11 @@ async def _callback(update, context):
             if draft["start"] <= datetime.now(UTC):
                 await context.bot.send_message(chat_id, "Start is no longer in the future. Cancel and create a new window.")
                 return
-            sid = store.create_schedule(context.application.bot_data["chat_id"], draft["start"], draft["end"], draft["posts"])
+            try:
+                sid = store.create_schedule(context.application.bot_data["chat_id"], draft["start"], draft["end"], draft["posts"])
+            except ValueError as exc:
+                await context.bot.send_message(chat_id, str(exc))
+                return
             _clear(context)
             await context.bot.send_message(chat_id, f"Schedule #{sid} committed.", reply_markup=MENU)
         return
@@ -395,7 +468,7 @@ async def _callback(update, context):
     elif action == "delete_yes":
         retained = store.delete_schedule(identifier)
         await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(chat_id, "Schedule deleted. In-flight sending rows were retained." if retained else "Schedule deleted (or already absent).")
+        await context.bot.send_message(chat_id, "Schedule deleted. In-flight sending rows were retained." if retained else "Schedule deleted (or already absent). Uncertain pool assets remain blocked; review Asset pool before reuse.")
     elif action in ("dismiss", "retry", "retry_yes"):
         # Old attention buttons must not resolve a post now queued or sending.
         post = next((post for post in store.attention() if post["id"] == identifier), None)
@@ -410,7 +483,7 @@ async def _callback(update, context):
         else:
             store.resolve(identifier, retry=action == "retry_yes")
             await query.edit_message_reply_markup(reply_markup=None)
-            await context.bot.send_message(chat_id, "Post queued for retry." if action == "retry_yes" else "Post discarded; it will not be retried.")
+            await context.bot.send_message(chat_id, "Post queued for retry." if action == "retry_yes" else "Post discarded; it will not be retried. Uncertain pool assets remain blocked; review Asset pool before reuse.")
 
 
 def register_handlers(application: Application, owner_id: int) -> None:
@@ -444,7 +517,9 @@ def register_handlers(application: Application, owner_id: int) -> None:
         return wrapper
 
     application.add_handler(CallbackQueryHandler(guarded(_callback)))
-    application.add_handler(MessageHandler(filters.ALL, guarded(_message)))
+    application.add_handler(MessageHandler(filters.UpdateType.MESSAGE, guarded(_message)))
+    from pool import ingest
+    application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, ingest))
 
 
 def build_application(token: str, owner_id: int, chat_id: Any, store: Any) -> Application:

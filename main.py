@@ -79,18 +79,54 @@ async def notify(app, post, attempted_at, result):
                     app.bot_data['owner_id'], type(exc).__name__)
 
 
+async def notify_startup(app):
+    pool_id = app.bot_data.get('pool_chat_id')
+    if pool_id is None:
+        log.info('Pool startup notification disabled: POOL_CHAT_ID is not configured')
+        return
+    from pool import STARTUP_PREFIX
+    text = STARTUP_PREFIX + datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    try:
+        await app.bot.send_message(chat_id=pool_id, text=text, parse_mode=None)
+    except Exception as exc:
+        error = type(exc).__name__
+        log.warning('Pool startup notification failed error_type=%s; no retry', error)
+        try:
+            await app.bot.send_message(
+                chat_id=app.bot_data['owner_id'],
+                text=f'Pool startup notification failed: {error}. '
+                'Check POOL_CHAT_ID and pool posting permissions. '
+                'Telegram may have accepted the message; it will not be retried. '
+                'Scheduler workers will still start.', parse_mode=None)
+        except Exception as report_exc:
+            log.warning('Startup owner report failed error_type=%s', type(report_exc).__name__)
+
+
 async def startup(app):
+    pool_id = app.bot_data.get('pool_chat_id')
+    destination = app.bot_data['chat_id']
+    if pool_id and isinstance(destination, str) and destination.startswith('@'):
+        resolved = await app.bot.get_chat(destination)
+        if resolved.id == pool_id:
+            raise ValueError('Pool and destination must be different channels.')
+    await notify_startup(app)
+    from pool import worker
     app.bot_data['worker'] = asyncio.create_task(delivery_worker(app))
+    app.bot_data['pool_worker'] = asyncio.create_task(worker(app))
 
 
 async def stop(app):
-    task = app.bot_data.get('worker')
-    if task:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    tasks = [app.bot_data.get('worker'), app.bot_data.get('pool_worker')]
+    tasks.extend(p['task'] for p in app.bot_data.get('pool_groups', {}).values())
+    for task in tasks:
+        if task:
+            task.cancel()
+    for task in tasks:
+        if task:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 def main():
@@ -117,11 +153,16 @@ def main():
     path.chmod(0o600)
     app = (Application.builder().token(token).concurrent_updates(False)
            .post_init(startup).post_stop(stop).build())
-    app.bot_data.update(store=store, chat_id=destination, owner_id=owner)
+    pool_id = os.environ.get('POOL_CHAT_ID', '').strip()
+    app.bot_data.update(store=store, chat_id=destination, owner_id=owner,
+                        pool_chat_id=int(pool_id) if pool_id else None)
+    if pool_id and (str(destination) == str(int(pool_id))):
+        raise SystemExit('POOL_CHAT_ID must differ from CHAT_ID to avoid importing deliveries.')
     register_handlers(app, owner)
     asyncio.set_event_loop(asyncio.new_event_loop())
     try:
-        app.run_polling(drop_pending_updates=False)
+        app.run_polling(drop_pending_updates=False,
+                        allowed_updates=['message', 'callback_query', 'channel_post'])
     finally:
         store.close()
         lock.close()

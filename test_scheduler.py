@@ -102,6 +102,74 @@ class InterfaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.send_message.call_args.kwargs['entities'][0].type, 'bold')
 
 
+class StartupTests(unittest.IsolatedAsyncioTestCase):
+    async def run_startup(self, pool_id, errors=None):
+        from main import startup, stop
+        app = SimpleNamespace(
+            bot_data={'pool_chat_id': pool_id, 'chat_id': -200, 'owner_id': 42},
+            bot=SimpleNamespace(send_message=AsyncMock(side_effect=errors)))
+
+        async def idle(app):
+            await asyncio.Event().wait()
+
+        with patch('main.delivery_worker', side_effect=idle), patch('pool.worker', side_effect=idle):
+            with self.assertLogs('main', level='INFO') as logs:
+                await startup(app)
+            try:
+                self.assertIsInstance(app.bot_data['worker'], asyncio.Task)
+                self.assertIsInstance(app.bot_data['pool_worker'], asyncio.Task)
+                self.assertFalse(app.bot_data['worker'].done())
+                self.assertFalse(app.bot_data['pool_worker'].done())
+            finally:
+                await stop(app)
+        return app.bot.send_message, '\n'.join(logs.output)
+
+    async def test_configured_pool_startup(self):
+        # Capture INFO even on the successful path without requiring a success log.
+        from main import log
+        with patch.object(log, 'info', wraps=log.info):
+            from main import startup, stop
+            app = SimpleNamespace(bot_data={'pool_chat_id': -100, 'chat_id': -200, 'owner_id': 42},
+                                  bot=SimpleNamespace(send_message=AsyncMock()))
+            async def idle(app):
+                await asyncio.Event().wait()
+            async def send(**kwargs):
+                self.assertNotIn('worker', app.bot_data)
+                self.assertNotIn('pool_worker', app.bot_data)
+            app.bot.send_message.side_effect = send
+            with patch('main.delivery_worker', side_effect=idle), patch('pool.worker', side_effect=idle):
+                before = datetime.now(UTC).replace(microsecond=0)
+                await startup(app)
+                after = datetime.now(UTC)
+                await stop(app)
+            app.bot.send_message.assert_awaited_once()
+            args = app.bot.send_message.call_args.kwargs
+            self.assertEqual(args['chat_id'], -100)
+            self.assertIsNone(args['parse_mode'])
+            stamp = datetime.strptime(args['text'], 'Scheduler started\nServer time: %Y-%m-%d %H:%M:%S UTC').replace(tzinfo=UTC)
+            self.assertLessEqual(before, stamp)
+            self.assertLessEqual(stamp, after)
+
+    async def test_no_pool_skips_send(self):
+        send, logs = await self.run_startup(None)
+        send.assert_not_awaited()
+        self.assertIn('disabled', logs)
+
+    async def test_failure_reports_owner_and_starts_workers_without_retry(self):
+        send, logs = await self.run_startup(-100, [TimeoutError('SECRET token'), None])
+        self.assertEqual(send.await_count, 2)
+        self.assertEqual(send.call_args_list[0].kwargs['chat_id'], -100)
+        self.assertEqual(send.call_args_list[1].kwargs['chat_id'], 42)
+        self.assertIn('will not be retried', send.call_args_list[1].kwargs['text'])
+        self.assertNotIn('SECRET', logs + str(send.call_args_list))
+
+    async def test_owner_report_failure_also_starts_workers(self):
+        send, logs = await self.run_startup(-100, [RuntimeError('SECRET'), RuntimeError('SECRET')])
+        self.assertEqual(send.await_count, 2)
+        self.assertIn('Startup owner report failed', logs)
+        self.assertNotIn('SECRET', logs + str(send.call_args_list))
+
+
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def check_delivery(self, error=None, report_error=None):
         from main import delivery_worker
