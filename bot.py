@@ -42,8 +42,10 @@ def _entities(values, bot):
     return [MessageEntity.de_json(value, bot) for value in (values or [])]
 
 
-async def send_content(bot, chat_id, content):
-    """Send a stored post without replacing Telegram entities with parse modes."""
+async def send_content(bot, chat_id, content, rate_limit_args=None):
+    """Send stored content; previews default to bulk priority unless overridden."""
+    if rate_limit_args is None:
+        rate_limit_args = {"priority": -10}
     kind = content["kind"]
     if kind == "text":
         message = await bot.send_message(
@@ -51,6 +53,7 @@ async def send_content(bot, chat_id, content):
             text=content["text"],
             entities=_entities(content.get("entities"), bot),
             parse_mode=None,
+            rate_limit_args=rate_limit_args,
         )
         return [message]
     media = content.get("media", [])
@@ -62,13 +65,15 @@ async def send_content(bot, chat_id, content):
             caption=item.get("caption") or None,
             caption_entities=_entities(item.get("caption_entities"), bot),
             parse_mode=None,
+            rate_limit_args=rate_limit_args,
         )
         return [message]
     if kind == "album":
         # A lone photo can occur if the draft was cancelled mid-album or Telegram
         # delivered only one item. Telegram does not accept single-item groups.
         if len(media) == 1:
-            return await send_content(bot, chat_id, {**content, "kind": "photo"})
+            return await send_content(bot, chat_id, {**content, "kind": "photo"},
+                                                  rate_limit_args=rate_limit_args)
         return list(await bot.send_media_group(
             chat_id=chat_id,
             media=[InputMediaPhoto(
@@ -77,6 +82,7 @@ async def send_content(bot, chat_id, content):
                 caption_entities=_entities(item.get("caption_entities"), bot),
                 parse_mode=None,
             ) for item in media],
+            rate_limit_args=rate_limit_args,
         ))
     raise ValueError(f"Unsupported post kind: {kind!r}")
 
@@ -635,7 +641,9 @@ def register_handlers(application: Application, owner_id: int) -> None:
 
 def build_application(token: str, owner_id: int, chat_id: Any, store: Any) -> Application:
     """Optional convenience factory. No environment reads and no worker startup."""
-    application = Application.builder().token(token).concurrent_updates(False).build()
+    from rate_limiter import TelegramRateLimiter
+    application = (Application.builder().token(token).concurrent_updates(False)
+                   .rate_limiter(TelegramRateLimiter()).build())
     application.bot_data.update(store=store, chat_id=chat_id)
     from error_reporting import application_error
     application.add_error_handler(application_error)

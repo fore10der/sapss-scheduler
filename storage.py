@@ -184,6 +184,14 @@ class Store:
                 self.db.execute("DELETE FROM posts WHERE id=? AND status IN ('uncertain','failed')", (post_id,))
             self._cleanup()
 
+    def peek_due(self):
+        """Inspect the next candidate without preventing edits while rate limited."""
+        row = self.db.execute("""SELECT p.*,s.chat_id FROM posts p
+            JOIN schedules s ON s.id=p.schedule_id
+            WHERE p.status='pending' AND p.due<=? ORDER BY p.due,p.id LIMIT 1""",
+            (datetime.now(UTC).isoformat(),)).fetchone()
+        return self._post(row)
+
     def claim(self):
         with self.db:
             row = self.db.execute("UPDATE posts SET status='sending' WHERE id=(SELECT id FROM posts WHERE status='pending' AND due<=? ORDER BY due,id LIMIT 1) RETURNING *", (datetime.now(UTC).isoformat(),)).fetchone()

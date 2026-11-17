@@ -105,6 +105,7 @@ async def maintain(app):
         try:
             result = await app.bot.send_message(
                 chat_id=int(job['source_chat']), text=text, parse_mode=None,
+                rate_limit_args={'priority': -10},
                 reply_parameters=ReplyParameters(
                     message_id=json.loads(job['source_ids'])[0],
                     allow_sending_without_reply=False))

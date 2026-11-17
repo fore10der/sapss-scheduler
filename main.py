@@ -9,7 +9,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram.error import BadRequest, Forbidden, RetryAfter
-from telegram.ext import Application
+from telegram.ext import Application, BaseRateLimiter
 
 from bot import register_handlers, send_content
 from error_reporting import application_error
@@ -31,6 +31,17 @@ def delivery_details(post, attempted_at, result):
 async def delivery_worker(app):
     store = app.bot_data['store']
     while True:
+        limiter = getattr(app.bot, 'rate_limiter', None)
+        if isinstance(limiter, BaseRateLimiter):
+            candidate = store.peek_due()
+            if not candidate:
+                await asyncio.sleep(1)
+                continue
+            content = candidate['content']
+            cost = len(content['media']) if content['kind'] == 'album' else 1
+            await limiter.wait_for_readiness(candidate['chat_id'], cost=cost)
+        # Readiness reserves nothing. Claim rechecks the current pending queue,
+        # including deletions/replacements made while the worker was waiting.
         post = store.claim()
         if not post:
             await asyncio.sleep(1)
@@ -38,7 +49,8 @@ async def delivery_worker(app):
         attempted_at = datetime.now(timezone.utc)
         log.info('Delivery %s', delivery_details(post, attempted_at, 'attempt'))
         try:
-            await send_content(app.bot, post['chat_id'], post['content'])
+            await send_content(app.bot, post['chat_id'], post['content'],
+                                           rate_limit_args={'priority': 10})
         except RetryAfter as exc:
             # Telegram explicitly rejected this attempt; retry after its cooldown.
             delay = exc.retry_after
@@ -152,7 +164,9 @@ def main():
         raise SystemExit('Another scheduler is already using this database.')
     store = Store(path)
     path.chmod(0o600)
+    from rate_limiter import TelegramRateLimiter
     app = (Application.builder().token(token).concurrent_updates(False)
+           .rate_limiter(TelegramRateLimiter())
            .post_init(startup).post_stop(stop).build())
     pool_id = os.environ.get('POOL_CHAT_ID', '').strip()
     app.bot_data.update(store=store, chat_id=destination, owner_id=owner,

@@ -114,7 +114,7 @@ class ErrorReportingTests(unittest.IsolatedAsyncioTestCase):
                   patch.object(main, 'register_handlers'),
                   patch.object(main.asyncio, 'new_event_loop', return_value=None),
                   patch.object(main.asyncio, 'set_event_loop')):
-                application.builder.return_value.token.return_value.concurrent_updates.return_value.post_init.return_value.post_stop.return_value.build.return_value = app
+                application.builder.return_value.token.return_value.concurrent_updates.return_value.rate_limiter.return_value.post_init.return_value.post_stop.return_value.build.return_value = app
                 main.main()
         app.add_error_handler.assert_called_once_with(application_error)
         app.run_polling.assert_called_once()
