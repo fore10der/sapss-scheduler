@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from telegram import ReplyParameters
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
 
@@ -34,8 +35,9 @@ async def ingest(update, context):
     if STARTUP_MESSAGE.fullmatch(getattr(message, 'text', None) or ''):
         return
     reply = getattr(message, 'reply_to_message', None)
-    if reply and data['store'].is_status_reply(
-            message.chat_id, reply.message_id, getattr(message, 'text', None)):
+    if data['store'].is_status_reply(
+            message.chat_id, reply.message_id if reply else None,
+            getattr(message, 'text', None), message.message_id):
         return
     content = content_of(message)
     if not content:
@@ -68,8 +70,11 @@ async def ingest(update, context):
 
 
 def marker(job):
-    return (f"[pool-status #{job['id']} r{job['revision']}]\n"
-            f"[{job['status']}" + (f" · {job['stamp']} UTC" if job['stamp'] else '') + ']')
+    label = {'pending': '⏳ Pending', 'published': '✅ Published'}[job['status']]
+    stamp = datetime.fromisoformat(job['stamp'])
+    if stamp.tzinfo is None:
+        raise ValueError('Pool status timestamp must be timezone-aware')
+    return f"{label} — {stamp.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
 
 
 
@@ -79,11 +84,12 @@ async def maintain(app):
         if job['status'] not in ('pending', 'published'):
             store.status_done(job['id'], job['revision'])
             continue
-        if not store.claim_status(job['id'], job['revision']):
+        text = marker(job)
+        if not store.claim_status(job['id'], job['revision'], text):
             continue
         try:
             result = await app.bot.send_message(
-                chat_id=int(job['source_chat']), text=marker(job), parse_mode=None,
+                chat_id=int(job['source_chat']), text=text, parse_mode=None,
                 reply_parameters=ReplyParameters(
                     message_id=json.loads(job['source_ids'])[0],
                     allow_sending_without_reply=False))

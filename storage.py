@@ -55,6 +55,8 @@ class Store:
             PRIMARY KEY(asset_id, revision));
         UPDATE status_notifications SET state='uncertain' WHERE state='sending';
         ''')
+        if 'text' not in [r[1] for r in self.db.execute('PRAGMA table_info(status_notifications)')]:
+            self.db.execute('ALTER TABLE status_notifications ADD COLUMN text TEXT')
         if 'asset_id' not in [r[1] for r in self.db.execute('PRAGMA table_info(posts)')]:
             self.db.execute('ALTER TABLE posts ADD COLUMN asset_id INTEGER REFERENCES assets(id)')
         self.db.execute('CREATE UNIQUE INDEX IF NOT EXISTS active_asset ON posts(asset_id) WHERE asset_id IS NOT NULL')
@@ -100,7 +102,7 @@ class Store:
                                               (t.isoformat(), aid)).rowcount
                     if not changed:
                         raise ValueError('Asset is no longer available. Refresh the pool.')
-                    p = json.loads(self.db.execute('SELECT content FROM assets WHERE id=?', (aid,)).fetchone()[0])
+                p = {key: value for key, value in p.items() if key != 'asset_id'}
                 self.db.execute('INSERT INTO posts(schedule_id,due,content,asset_id) VALUES(?,?,?,?)',
                                 (sid, t.isoformat(), json.dumps(p), aid))
         return sid
@@ -207,11 +209,11 @@ class Store:
             WHERE n.asset_id=a.id AND n.revision=a.revision)
             ORDER BY o.seq,a.id''')]
 
-    def claim_status(self, asset_id, revision):
+    def claim_status(self, asset_id, revision, text=None):
         with self.db:
             return bool(self.db.execute('''INSERT OR IGNORE INTO status_notifications
-                (asset_id,revision,state) SELECT id,revision,'sending' FROM assets
-                WHERE id=? AND revision=? AND dirty=1''', (asset_id, revision)).rowcount)
+                (asset_id,revision,state,text) SELECT id,revision,'sending',? FROM assets
+                WHERE id=? AND revision=? AND dirty=1''', (text, asset_id, revision)).rowcount)
 
     def status_result(self, asset_id, revision, state, message_id=None):
         with self.db:
@@ -232,15 +234,27 @@ class Store:
             self.db.execute('UPDATE status_notifications SET reported=1 WHERE asset_id=? AND revision=?',
                             (asset_id, revision))
 
-    def is_status_reply(self, chat_id, source_id, text):
-        # The claim exists before the HTTP send, including during update/result races.
+    def is_status_reply(self, chat_id, source_id, text, message_id=None):
+        # Persisted text belongs to the claimed revision, not the asset's current
+        # state. It protects updates arriving before the send result or after restart.
+        if message_id is not None and self.db.execute('''SELECT 1 FROM status_notifications n
+                JOIN assets a ON a.id=n.asset_id
+                WHERE a.source_chat=? AND n.message_id=? AND n.state='sent' ''',
+                (str(chat_id), message_id)).fetchone():
+            return True
+        rows = self.db.execute('''SELECT a.source_ids FROM status_notifications n
+            JOIN assets a ON a.id=n.asset_id WHERE a.source_chat=? AND n.text=?
+            AND n.state IN ('sending','sent','uncertain')''', (str(chat_id), text))
+        if any(json.loads(row['source_ids'])[0] == source_id for row in rows):
+            return True
+        # Delayed updates from the previous visible-prefix format remain excluded.
         import re
         match = re.match(r'^\[pool-status #(\d+) r(\d+)\]\n', text or '')
         if not match:
             return False
         row = self.db.execute('''SELECT a.source_ids FROM assets a
             JOIN status_notifications n ON n.asset_id=a.id
-            WHERE a.source_chat=? AND a.id=? AND n.revision=?''',
+            WHERE a.source_chat=? AND a.id=? AND n.revision=? AND n.text IS NULL''',
             (str(chat_id), int(match[1]), int(match[2]))).fetchone()
         return bool(row and json.loads(row['source_ids'])[0] == source_id)
 

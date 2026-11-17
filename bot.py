@@ -12,6 +12,7 @@ synchronous. The storage module must also export schedule_times(start, end, coun
 """
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -155,10 +156,14 @@ async def _album_flush(context, chat_id, draft, group_id):
         if context.user_data.get("draft") is not draft:
             return
         pending = draft["pending"].pop(group_id)
-        # Sort by Telegram message ID rather than arrival order.
-        pending["post"]["media"] = [item for _, item in sorted(pending["items"].items())]
-        await context.bot.send_message(chat_id, f"Accepted album: {len(pending['post']['media'])} photos. "
-                                       'Standalone post, not linked to a pool asset. For pool tracking use Asset pool → Add to draft.')
+        if 'asset_id' in pending:
+            detail = f"Pool asset #{pending['asset_id']}: received captions preserved; full album selected."
+        else:
+            # Standalone albums use private message order; linked albums retain
+            # source order and replace only the exact forwarded source members.
+            pending['post']['media'] = [item for _, item in sorted(pending['items'].items())]
+            detail = 'Standalone post, not linked to a pool asset. For pool tracking use Asset pool → Add to draft.'
+        await context.bot.send_message(chat_id, f"Accepted album: {len(pending['post']['media'])} photos. {detail}")
         await _summary(context, chat_id)
     except asyncio.CancelledError:
         pass
@@ -312,21 +317,53 @@ async def _message(update, context):
             if asset is None:
                 raise ValueError('Pool source is not stored yet (or was never imported). Wait for album ingestion, then use Asset pool → Add to draft.')
             aid = asset['id']
-            if any(post.get('asset_id') == aid for post in draft['posts']):
+            pending = draft['pending'].get(message.media_group_id) if message.media_group_id else None
+            continuing = pending is not None and pending.get('asset_id') == aid
+            if any(post.get('asset_id') == aid for post in draft['posts']) and not continuing:
                 await message.reply_text(f"Asset #{aid} is already selected in this draft; not added again.")
                 return
-            storage.schedule_times(draft['start'], draft['end'], len(draft['posts']) + 1)
-            post = store.asset_content(aid)
+            from pool import content_of
+            incoming = content_of(message)
+            if incoming is None:
+                raise ValueError('Only text and photos are supported.')
+            if not continuing:
+                storage.schedule_times(draft['start'], draft['end'], len(draft['posts']) + 1)
+                post = store.asset_content(aid)
+            else:
+                post = pending['post']
+            if post['kind'] == 'album':
+                if incoming['kind'] != 'photo':
+                    raise ValueError('An album source must be forwarded as a photo.')
+                index = json.loads(asset['source_ids']).index(origin.message_id)
+                post['media'][index] = incoming['media'][0]
+            else:
+                post = {**incoming, 'asset_id': aid}
         except ValueError as exc:
             await message.reply_text(f"Not added: {exc} Use Asset pool to review availability.")
             return
-        draft['posts'].append(post)
-        detail = ' Full stored album selected, including all photos and original captions.' if post['kind'] == 'album' else ' Stored original content selected.'
+        if not continuing:
+            draft['posts'].append(post)
+        if post['kind'] == 'album' and message.media_group_id:
+            gid = message.media_group_id
+            if continuing:
+                pending['task'].cancel()
+            else:
+                pending = {'post': post, 'asset_id': aid}
+                draft['pending'][gid] = pending
+            pending['task'] = asyncio.create_task(_album_flush(context, chat_id, draft, gid))
+            if not continuing:
+                await message.reply_text(f"Selected pool asset #{aid}. Full album selected; receiving forwarded captions. Wait, then use Preview before Commit.")
+            return
+        detail = ' Full album selected; received photo/caption preserved, unforwarded members unchanged.' if post['kind'] == 'album' else ' Received text/caption and formatting preserved.'
         await message.reply_text(f"Selected pool asset #{aid}.{detail} Use Preview to inspect it; Commit reserves it.")
         await _summary(context, chat_id)
         return
     if origin is not None and getattr(origin, 'type', None) == 'hidden_user':
         await message.reply_text('Not added: Telegram hid the forwarding source, so no pool asset can be identified safely. Use Asset pool → Add to draft for a pool asset, or send an original upload for a standalone post.')
+        return
+    pending = draft['pending'].get(message.media_group_id) if message.media_group_id else None
+    if pending is not None and 'asset_id' in pending:
+        await message.reply_text('This album item has no matching pool source attribution and was not added. Its stored original is unchanged. Use Preview to review the full album before Commit.')
         return
     if not (message.media_group_id and message.media_group_id in draft["pending"]):
         try:

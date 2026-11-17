@@ -44,6 +44,87 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             self.store.db.execute('UPDATE posts SET due=?', ((datetime.now(UTC)-timedelta(seconds=1)).isoformat(),))
         return self.store.claim()
 
+    def test_marker_exact_human_format_and_utc_conversion(self):
+        for status, expected in [('pending', '⏳ Pending'), ('published', '✅ Published')]:
+            for stamp in ('2026-11-20T12:00:59.123456+00:00',
+                          '2026-11-20T14:30:59+02:30', '2026-11-20T12:00:00Z'):
+                with self.subTest(status=status, stamp=stamp):
+                    self.assertEqual(marker({'id': 77, 'revision': 123, 'status': status, 'stamp': stamp}),
+                                     f'{expected} — 2026-11-20 12:00 UTC')
+        with self.assertRaises(ValueError):
+            marker({'status': 'pending', 'stamp': '2026-11-20T12:00:00'})
+
+    async def test_published_uses_confirmed_time_not_scheduled_time(self):
+        self.schedule(self.add())
+        post = self.due()
+        with patch('storage.datetime') as clock:
+            clock.now.return_value = datetime(2026, 11, 20, 12, 0, 59, tzinfo=UTC)
+            self.store.finish(post['id'])
+        await maintain(self.app)
+        self.assertEqual(self.app.bot.send_message.call_args.kwargs['text'],
+                         '✅ Published — 2026-11-20 12:00 UTC')
+
+    async def test_human_reply_snapshot_survives_restart_and_new_revision(self):
+        aid = self.add()
+        sid = self.schedule(aid)
+        text = marker(self.store.status_jobs()[0])
+        self.assertTrue(self.store.claim_status(aid, 2, text))
+        self.store.delete_schedule(sid)
+        self.start += timedelta(minutes=10)
+        self.end += timedelta(minutes=10)
+        self.schedule(aid)
+        self.store.close()
+        self.store = Store(self.path)
+        self.app.bot_data['store'] = self.store
+        context = SimpleNamespace(application=self.app)
+        msg = SimpleNamespace(chat_id=-100, message_id=900, text=text,
+                              reply_to_message=SimpleNamespace(message_id=10),
+                              photo=[], entities=[], media_group_id=None)
+        await ingest(SimpleNamespace(channel_post=msg), context)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM assets').fetchone()[0], 1)
+        self.assertTrue(self.store.is_status_reply(-100, 10, text))
+        # Success mapping also works when Telegram omits the reply target.
+        self.store.status_result(aid, 2, 'sent', 900)
+        msg.reply_to_message = None
+        await ingest(SimpleNamespace(channel_post=msg), context)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM assets').fetchone()[0], 1)
+
+    async def test_human_status_not_globally_reserved(self):
+        aid = self.add()
+        self.schedule(aid)
+        text = marker(self.store.status_jobs()[0])
+        self.assertFalse(self.store.is_status_reply(-100, 10, text))
+        self.assertTrue(self.store.claim_status(aid, 2, text))
+        self.assertFalse(self.store.is_status_reply(-200, 10, text))
+        self.assertFalse(self.store.is_status_reply(-100, 11, text))
+        self.assertFalse(self.store.is_status_reply(-100, 10, text + ' source content'))
+        context = SimpleNamespace(application=self.app)
+        for mid, reply, value in [(901, None, text),
+                                  (902, SimpleNamespace(message_id=11), text),
+                                  (903, SimpleNamespace(message_id=10), text + ' source content')]:
+            msg = SimpleNamespace(chat_id=-100, message_id=mid, text=value,
+                                  reply_to_message=reply, photo=[], entities=[], media_group_id=None)
+            await ingest(SimpleNamespace(channel_post=msg), context)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM assets').fetchone()[0], 4)
+
+    async def test_notification_text_migration_preserves_legacy_claim(self):
+        aid = self.add()
+        sid = self.schedule(aid)
+        with self.store.db:
+            self.store.db.execute('DROP TABLE status_notifications')
+            self.store.db.execute('''CREATE TABLE status_notifications (
+                asset_id INTEGER NOT NULL REFERENCES assets(id), revision INTEGER NOT NULL,
+                state TEXT NOT NULL, message_id INTEGER, reported INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(asset_id,revision))''')
+            self.store.db.execute('INSERT INTO status_notifications VALUES(?,?,?,NULL,0)', (aid, 2, 'sending'))
+        self.store.close()
+        self.store = Store(self.path)
+        self.app.bot_data['store'] = self.store
+        self.assertEqual(len(self.store.get_posts(sid)), 1)
+        self.assertEqual(self.store.status_jobs(), [])
+        self.assertTrue(self.store.is_status_reply(-100, 10, f'[pool-status #{aid} r2]\n[pending]'))
+        self.assertEqual(len(self.store.uncertain_notifications()), 1)
+
     async def test_identifiers_original_and_lifecycle(self):
         aid = self.add(PHOTO)
         row = self.store.assets()[0]
@@ -57,7 +138,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first['chat_id'], -100)
         self.assertEqual(first['reply_parameters'].message_id, 10)
         self.assertFalse(first['reply_parameters'].allow_sending_without_reply)
-        self.assertEqual(first['text'], f'[pool-status #{aid} r2]\n[pending · {self.start.isoformat()} UTC]')
+        self.assertEqual(first['text'], f"⏳ Pending — {self.start.strftime('%Y-%m-%d %H:%M UTC')}")
         self.assertEqual(self.store.get_posts(sid)[0]['content'], PHOTO)
         self.assertEqual(self.store.assets('pending')[0]['stamp'], self.start.isoformat())
         await maintain(self.app)
@@ -73,7 +154,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(published['content'])
         self.assertIsNotNone(published['stamp'])
         await maintain(self.app)
-        self.assertIn('[published', self.app.bot.send_message.call_args.kwargs['text'])
+        self.assertEqual(self.app.bot.send_message.call_args.kwargs['text'], marker(published))
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM asset_originals').fetchone()[0], 0)
         self.app.bot.edit_message_caption.assert_not_awaited()
         self.app.bot.edit_message_text.assert_not_awaited()
@@ -91,7 +172,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         await maintain(self.app)
         calls = self.app.bot.send_message.call_args_list
         self.assertEqual([c.kwargs['reply_parameters'].message_id for c in calls], expected)
-        self.assertTrue(all('[pending' in c.kwargs['text'] for c in calls))
+        self.assertTrue(all(c.kwargs['text'].startswith('⏳ Pending — ') for c in calls))
         await maintain(self.app)
         self.assertEqual(self.app.bot.send_message.await_count, 3)
 
@@ -116,7 +197,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         await maintain(self.app)
         calls = self.app.bot.send_message.call_args_list
         self.assertEqual([c.kwargs['reply_parameters'].message_id for c in calls], [30, 10, 20])
-        self.assertTrue(all('[published' in c.kwargs['text'] for c in calls))
+        self.assertTrue(all(c.kwargs['text'].startswith('✅ Published — ') for c in calls))
 
     async def test_mixed_backlog_follows_latest_transition_sequence(self):
         first = self.store.add_asset(-100, [10], TEXT)
@@ -131,8 +212,8 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         await maintain(self.app)
         calls = self.app.bot.send_message.call_args_list
         self.assertEqual([c.kwargs['reply_parameters'].message_id for c in calls], [10, 20])
-        self.assertIn('[pending', calls[0].kwargs['text'])
-        self.assertIn('[published', calls[1].kwargs['text'])
+        self.assertIn('⏳ Pending — ', calls[0].kwargs['text'])
+        self.assertIn('✅ Published — ', calls[1].kwargs['text'])
 
     async def test_legacy_status_order_migration_preserves_queue_and_claims(self):
         aids = [self.store.add_asset(-100, [mid], TEXT) for mid in (10, 20, 30)]
@@ -274,16 +355,45 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
                                caption='changed caption', caption_entities=[], entities=[],
                                media_group_id=group, forward_origin=origin, reply_text=AsyncMock())
 
+    async def test_forwarded_text_keeps_received_text_and_entities(self):
+        from bot import _message
+        from telegram import MessageEntity
+        aid = self.add()
+        context = self.forward_context()
+        msg = self.forwarded_message()
+        msg.text = '😀new forwarded text'
+        msg.entities = [MessageEntity('bold', 2, 3)]
+        await _message(SimpleNamespace(effective_message=msg), context)
+        post = context.user_data['draft']['posts'][0]
+        self.assertEqual(post['text'], msg.text)
+        self.assertEqual(post['entities'], [e.to_dict() for e in msg.entities])
+        self.assertEqual(post['asset_id'], aid)
+
+    async def test_commit_keeps_approved_snapshot_not_pool_original(self):
+        aid = self.add()
+        snapshot = {**self.store.asset_content(aid), 'text': 'approved draft text', 'entities': []}
+        sid = self.store.create_schedule(123, self.start, self.end, [snapshot])
+        saved = self.store.get_posts(sid)[0]['content']
+        self.assertEqual(saved['text'], 'approved draft text')
+        self.assertNotIn('asset_id', saved)
+        original = json.loads(self.store.db.execute('SELECT content FROM assets WHERE id=?', (aid,)).fetchone()[0])
+        self.assertEqual(original, TEXT)
+
     async def test_forwarded_text_and_photo_link_exact_source_and_commit(self):
-        from bot import _message, _callback
+        from bot import _message, _callback, send_content
+        from pool import content_of
+        from telegram import MessageEntity
         for content in (TEXT, {'kind': 'photo', 'media': [PHOTO['media'][0]]}):
             with self.subTest(kind=content['kind']):
                 source_id = 20 if content['kind'] == 'text' else 21
                 aid = self.store.add_asset(-100, [source_id], content)
                 context = self.forward_context()
                 msg = self.forwarded_message(source_id, photo=content['kind'] == 'photo')
+                msg.entities = [MessageEntity('bold', 0, 9)]
+                msg.caption_entities = [MessageEntity('italic', 0, 7)]
+                expected = content_of(msg)
                 await _message(SimpleNamespace(effective_message=msg), context)
-                self.assertEqual(context.user_data['draft']['posts'], [{**content, 'asset_id': aid}])
+                self.assertEqual(context.user_data['draft']['posts'], [{**expected, 'asset_id': aid}])
                 self.assertIn(aid, [asset['id'] for asset in self.store.assets()])
                 query = SimpleNamespace(data='draft:forward1:commit', answer=AsyncMock())
                 self.app.bot_data['chat_id'] = 123
@@ -291,27 +401,58 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
                     await _callback(SimpleNamespace(callback_query=query, effective_chat=SimpleNamespace(id=42)), context)
                 row = self.store.db.execute('SELECT * FROM posts WHERE asset_id=?', (aid,)).fetchone()
                 self.assertIsNotNone(row)
-                self.assertEqual(json.loads(row['content']), content)
+                saved = json.loads(row['content'])
+                self.assertEqual(saved, expected)
+                self.assertNotIn('asset_id', saved)
+                self.assertEqual(json.loads(self.store.db.execute('SELECT content FROM assets WHERE id=?', (aid,)).fetchone()[0]), content)
+                sender = SimpleNamespace(send_message=AsyncMock(), send_photo=AsyncMock())
+                await send_content(sender, 123, saved)
+                sent = (sender.send_message if content['kind'] == 'text' else sender.send_photo).call_args.kwargs
+                key = 'text' if content['kind'] == 'text' else 'caption'
+                entities_key = 'entities' if content['kind'] == 'text' else 'caption_entities'
+                self.assertEqual(sent[key], msg.text if key == 'text' else msg.caption)
+                self.assertEqual([e.to_dict() for e in sent[entities_key]], [e.to_dict() for e in getattr(msg, entities_key)])
                 await maintain(self.app)
                 call = self.app.bot.send_message.call_args.kwargs
                 self.assertEqual(call['reply_parameters'].message_id, source_id)
-                self.assertIn('[pending', call['text'])
+                self.assertIn('⏳ Pending — ', call['text'])
 
     async def test_forwarded_album_members_select_full_asset_once(self):
         from bot import _message, _callback
         aid = self.add(PHOTO)
         context = self.forward_context()
+        from telegram import MessageEntity
+        from pool import content_of
+        expected = json.loads(json.dumps(PHOTO))
         for source_id in [11, 10, 11]:
             msg = self.forwarded_message(source_id, group='forwarded-album', photo=True)
+            msg.caption = f'😀forwarded caption {source_id}'
+            msg.caption_entities = [MessageEntity('bold', 2, 9)]
+            expected['media'][source_id - 10] = content_of(msg)['media'][0]
             await _message(SimpleNamespace(effective_message=msg), context)
         draft = context.user_data['draft']
-        self.assertEqual(draft['posts'], [{**PHOTO, 'asset_id': aid}])
+        self.assertEqual(draft['posts'], [{**expected, 'asset_id': aid}])
+        self.assertIn('forwarded-album', draft['pending'])
+        # Commit must wait for all forwarded album updates.
+        query = SimpleNamespace(data='draft:forward1:commit', answer=AsyncMock())
+        await _callback(SimpleNamespace(callback_query=query, effective_chat=SimpleNamespace(id=42)), context)
+        self.assertEqual(self.store.list_schedules(), [])
+        await asyncio.sleep(1.6)
         self.assertEqual(draft['pending'], {})
         query = SimpleNamespace(data=f'asset:forward1:{aid}', answer=AsyncMock())
         await _callback(SimpleNamespace(callback_query=query, effective_chat=SimpleNamespace(id=42)), context)
         self.assertEqual(len(draft['posts']), 1)
         sid = self.store.create_schedule(123, self.start, self.end, draft['posts'])
-        self.assertEqual(self.store.get_posts(sid)[0]['content'], PHOTO)
+        saved = self.store.get_posts(sid)[0]['content']
+        self.assertEqual(saved, expected)
+        from bot import send_content
+        sender = SimpleNamespace(send_media_group=AsyncMock(return_value=[]))
+        await send_content(sender, 123, saved)
+        sent = sender.send_media_group.call_args.kwargs['media']
+        self.assertEqual([m.caption for m in sent], [m['caption'] for m in expected['media']])
+        self.assertEqual([[e.to_dict() for e in m.caption_entities] for m in sent],
+                         [m['caption_entities'] for m in expected['media']])
+        self.assertEqual(json.loads(self.store.db.execute('SELECT content FROM assets WHERE id=?', (aid,)).fetchone()[0]), PHOTO)
         await maintain(self.app)
         self.assertEqual(self.app.bot.send_message.call_args.kwargs['reply_parameters'].message_id, 10)
         # Late members after commit cannot escape the asset reservation as standalone posts.
@@ -319,6 +460,39 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         await _message(SimpleNamespace(effective_message=self.forwarded_message(11, group='forwarded-album', photo=True)), later_context)
         self.assertEqual(later_context.user_data['draft']['posts'], [])
         self.assertEqual(len(self.store.get_posts(sid)), 1)
+
+    async def test_single_forwarded_album_member_preserves_empty_caption(self):
+        from bot import _message
+        aid = self.add(PHOTO)
+        context = self.forward_context()
+        msg = self.forwarded_message(11, photo=True)
+        msg.caption = None
+        await _message(SimpleNamespace(effective_message=msg), context)
+        draft = context.user_data['draft']
+        post = draft['posts'][0]
+        self.assertEqual(post['media'][0], PHOTO['media'][0])
+        self.assertEqual(post['media'][1]['caption'], '')
+        self.assertEqual(post['media'][1]['caption_entities'], [])
+        self.assertEqual(post['asset_id'], aid)
+        sid = self.store.create_schedule(123, self.start, self.end, draft['posts'])
+        self.assertEqual(self.store.get_posts(sid)[0]['content']['media'][1]['caption'], '')
+
+    async def test_linked_album_unattributed_item_is_not_guessed(self):
+        from bot import _message, _clear
+        self.add(PHOTO)
+        context = self.forward_context()
+        msg = self.forwarded_message(10, group='linked', photo=True)
+        await _message(SimpleNamespace(effective_message=msg), context)
+        msg = self.forwarded_message(11, group='linked', photo=True)
+        msg.forward_origin = None
+        try:
+            await _message(SimpleNamespace(effective_message=msg), context)
+            self.assertIn('was not added', msg.reply_text.call_args.args[0])
+            post = context.user_data['draft']['posts'][0]
+            self.assertEqual(post['media'][1], PHOTO['media'][1])
+            self.assertEqual(len(context.user_data['draft']['posts']), 1)
+        finally:
+            _clear(context)
 
     async def test_forwarded_unavailable_asset_never_becomes_standalone(self):
         from bot import _message
@@ -452,7 +626,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         pool_calls = [c for c in self.app.bot.send_message.call_args_list
                       if c.kwargs.get('chat_id') == -100]
         self.assertEqual(len(pool_calls), 2)
-        self.assertIn('[pending', pool_calls[-1].kwargs['text'])
+        self.assertIn('⏳ Pending — ', pool_calls[-1].kwargs['text'])
         for call in self.app.bot.send_message.call_args_list:
             self.assertNotIn('secret raw details', str(call))
 
@@ -506,10 +680,13 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             msg = SimpleNamespace(chat_id=-100, message_id=900,
                                   reply_to_message=SimpleNamespace(message_id=10),
                                   text=kwargs['text'], entities=[], photo=[], media_group_id=None)
-            await ingest(SimpleNamespace(channel_post=msg), context)
-            # A state transition during the request must not be cleared by its result.
+            # Advance the asset before its old reply update arrives; the claim's
+            # snapshot must identify the old text rather than the current stamp.
             self.store.delete_schedule(sid)
+            self.start += timedelta(minutes=10)
+            self.end += timedelta(minutes=10)
             self.schedule(aid)
+            await ingest(SimpleNamespace(channel_post=msg), context)
             return SimpleNamespace(message_id=900)
         self.app.bot.send_message.side_effect = send
         await maintain(self.app)
@@ -532,7 +709,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get_posts(sid)[0]['content'], TEXT)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM asset_originals').fetchone()[0], 1)
         await maintain(self.app)
-        self.assertIn('[pending', self.app.bot.send_message.call_args.kwargs['text'])
+        self.assertIn('⏳ Pending — ', self.app.bot.send_message.call_args.kwargs['text'])
 
     async def test_startup_notification_ignored_even_after_restart(self):
         from main import notify_startup
