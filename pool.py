@@ -26,7 +26,8 @@ def content_of(message):
 
 
 async def ingest(update, context):
-    message = getattr(update, 'channel_post', None)
+    edited = getattr(update, 'edited_channel_post', None)
+    message = edited or getattr(update, 'channel_post', None)
     data = context.application.bot_data
     if not message or str(message.chat_id) != str(data.get('pool_chat_id')):
         return
@@ -41,6 +42,9 @@ async def ingest(update, context):
         return
     content = content_of(message)
     if not content:
+        return
+    if edited:
+        data['store'].update_asset_content(message.chat_id, message.message_id, content)
         return
     if not message.media_group_id:
         data['store'].add_asset(message.chat_id, [message.message_id], content)
@@ -70,18 +74,29 @@ async def ingest(update, context):
 
 
 def marker(job):
+    reason = job.get('status_reason')
+    if job['status'] == 'available':
+        return {
+            'deleted': '♻️ Available — removed from the schedule; ready to schedule again.',
+            'replaced': '♻️ Available — replaced in the schedule by another asset; ready to schedule again.',
+        }[reason]
     label = {'pending': '⏳ Pending', 'published': '✅ Published'}[job['status']]
+    if job['status'] == 'pending' and reason == 'replacement':
+        label += ' (replacement for another scheduled asset)'
     stamp = datetime.fromisoformat(job['stamp'])
     if stamp.tzinfo is None:
         raise ValueError('Pool status timestamp must be timezone-aware')
-    return f"{label} — {stamp.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    text = f"{label} — {stamp.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    return text + '\n#to_delete' if job['status'] == 'published' else text
 
 
 
 async def maintain(app):
     store = app.bot_data['store']
     for job in store.status_jobs():
-        if job['status'] not in ('pending', 'published'):
+        if (job['status'] not in ('available', 'pending', 'published')
+                or (job['status'] == 'available'
+                    and job.get('status_reason') not in ('deleted', 'replaced'))):
             store.status_done(job['id'], job['revision'])
             continue
         text = marker(job)

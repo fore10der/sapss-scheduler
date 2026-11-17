@@ -50,9 +50,43 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
                           '2026-11-20T14:30:59+02:30', '2026-11-20T12:00:00Z'):
                 with self.subTest(status=status, stamp=stamp):
                     self.assertEqual(marker({'id': 77, 'revision': 123, 'status': status, 'stamp': stamp}),
-                                     f'{expected} — 2026-11-20 12:00 UTC')
+                                     f'{expected} — 2026-11-20 12:00 UTC'
+                                     + ('\n#to_delete' if status == 'published' else ''))
         with self.assertRaises(ValueError):
             marker({'status': 'pending', 'stamp': '2026-11-20T12:00:00'})
+
+    def test_marker_release_reasons_and_pending_replacement(self):
+        for reason, expected in (
+                ('deleted', '♻️ Available — removed from the schedule; ready to schedule again.'),
+                ('replaced', '♻️ Available — replaced in the schedule by another asset; ready to schedule again.')):
+            with self.subTest(reason=reason):
+                self.assertEqual(marker({'status': 'available', 'status_reason': reason,
+                                         'stamp': None}), expected)
+        self.assertEqual(marker({'status': 'pending', 'status_reason': 'replacement',
+                                 'stamp': '2026-11-20T12:00:00+00:00'}),
+                         '⏳ Pending (replacement for another scheduled asset) — 2026-11-20 12:00 UTC')
+
+    async def test_maintain_available_release_reasons_after_restart(self):
+        for source_id, reason in ((20, 'deleted'), (30, 'replaced')):
+            with self.subTest(reason=reason):
+                aid = self.store.add_asset(-100, [source_id, source_id + 1], PHOTO)
+                with self.store.db:
+                    self.store._asset_status(aid, 'available', reason=reason)
+                self.store.close()
+                self.store = Store(self.path)
+                self.app.bot_data['store'] = self.store
+                self.app.bot.send_message.reset_mock()
+                await maintain(self.app)
+                self.app.bot.send_message.assert_awaited_once()
+                call = self.app.bot.send_message.call_args.kwargs
+                asset = next(row for row in self.store.assets() if row['id'] == aid)
+                self.assertEqual(call['text'], marker(asset))
+                self.assertEqual(call['chat_id'], -100)
+                self.assertEqual(call['reply_parameters'].message_id, source_id)
+                self.assertFalse(call['reply_parameters'].allow_sending_without_reply)
+                self.assertIsNone(call['parse_mode'])
+                await maintain(self.app)
+                self.app.bot.send_message.assert_awaited_once()
 
     async def test_published_uses_confirmed_time_not_scheduled_time(self):
         self.schedule(self.add())
@@ -62,7 +96,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             self.store.finish(post['id'])
         await maintain(self.app)
         self.assertEqual(self.app.bot.send_message.call_args.kwargs['text'],
-                         '✅ Published — 2026-11-20 12:00 UTC')
+                         '✅ Published — 2026-11-20 12:00 UTC\n#to_delete')
 
     async def test_human_reply_snapshot_survives_restart_and_new_revision(self):
         aid = self.add()
@@ -732,6 +766,46 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             message.message_id, message.text = mid, text
             await ingest(SimpleNamespace(channel_post=message), context)
         self.assertEqual(len(self.store.assets()), 3)
+
+    async def test_edited_channel_post_updates_pending_text_without_ingestion(self):
+        aid = self.add()
+        sid = self.schedule(aid)
+        before = self.store.get_posts(sid)[0]
+        message = SimpleNamespace(chat_id=-100, message_id=10, text='edited text',
+                                  entities=[], photo=[], media_group_id=None)
+        context = SimpleNamespace(application=self.app)
+        with patch.object(self.store, 'add_asset', wraps=self.store.add_asset) as add:
+            await ingest(SimpleNamespace(edited_channel_post=message), context)
+            message.message_id = 999
+            await ingest(SimpleNamespace(edited_channel_post=message), context)
+            message.message_id, message.chat_id = 10, -200
+            await ingest(SimpleNamespace(edited_channel_post=message), context)
+            add.assert_not_called()
+        after = self.store.get_posts(sid)[0]
+        self.assertEqual(after['content'], {'kind': 'text', 'text': 'edited text', 'entities': []})
+        self.assertEqual(json.loads(self.store.assets('pending')[0]['content']), after['content'])
+        self.assertEqual(after['due'], before['due'])
+        self.assertEqual(len(self.store.assets('pending')), 1)
+        self.assertNotIn('pool_groups', self.app.bot_data)
+
+    async def test_edited_album_member_propagates_caption_and_media(self):
+        aid = self.add(PHOTO)
+        sid = self.schedule(aid)
+        message = SimpleNamespace(chat_id=-100, message_id=11, text=None,
+                                  photo=[SimpleNamespace(file_id='edited-photo')],
+                                  caption='edited caption', caption_entities=[
+                                      SimpleNamespace(to_dict=lambda: TEXT['entities'][0])],
+                                  media_group_id='album')
+        with patch.object(self.store, 'add_asset', wraps=self.store.add_asset) as add:
+            await ingest(SimpleNamespace(edited_channel_post=message),
+                         SimpleNamespace(application=self.app))
+            add.assert_not_called()
+        expected = {'kind': 'album', 'media': [PHOTO['media'][0], {
+            'file_id': 'edited-photo', 'caption': 'edited caption',
+            'caption_entities': TEXT['entities']}]}
+        self.assertEqual(self.store.get_posts(sid)[0]['content'], expected)
+        self.assertEqual(json.loads(self.store.assets('pending')[0]['content']), expected)
+        self.assertNotIn('pool_groups', self.app.bot_data)
 
     async def test_ingestion_filters_edits_and_other_channels_and_album(self):
         context = SimpleNamespace(application=self.app)

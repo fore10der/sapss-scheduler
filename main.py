@@ -164,7 +164,7 @@ def main():
     asyncio.set_event_loop(asyncio.new_event_loop())
     try:
         app.run_polling(drop_pending_updates=False,
-                        allowed_updates=['message', 'callback_query', 'channel_post'])
+                        allowed_updates=['message', 'callback_query', 'channel_post', 'edited_channel_post'])
     finally:
         store.close()
         lock.close()

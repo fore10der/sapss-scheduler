@@ -55,6 +55,8 @@ class Store:
             PRIMARY KEY(asset_id, revision));
         UPDATE status_notifications SET state='uncertain' WHERE state='sending';
         ''')
+        if 'status_reason' not in [r[1] for r in self.db.execute('PRAGMA table_info(assets)')]:
+            self.db.execute('ALTER TABLE assets ADD COLUMN status_reason TEXT')
         if 'text' not in [r[1] for r in self.db.execute('PRAGMA table_info(status_notifications)')]:
             self.db.execute('ALTER TABLE status_notifications ADD COLUMN text TEXT')
         if 'asset_id' not in [r[1] for r in self.db.execute('PRAGMA table_info(posts)')]:
@@ -98,7 +100,7 @@ class Store:
             for t, p in zip(times, posts):
                 aid = p.get('asset_id')
                 if aid is not None:
-                    changed = self.db.execute("UPDATE assets SET status='pending',stamp=?,dirty=1,revision=revision+1 WHERE id=? AND status='available' AND content IS NOT NULL",
+                    changed = self.db.execute("UPDATE assets SET status='pending',stamp=?,status_reason=NULL,dirty=1,revision=revision+1 WHERE id=? AND status='available' AND content IS NOT NULL",
                                               (t.isoformat(), aid)).rowcount
                     if not changed:
                         raise ValueError('Asset is no longer available. Refresh the pool.')
@@ -121,10 +123,48 @@ class Store:
     def get_posts(self, schedule_id):
         return [self._post(r) for r in self.db.execute('SELECT * FROM posts WHERE schedule_id=? ORDER BY due,id', (schedule_id,))]
 
+    def delete_post(self, post_id):
+        """Delete only a pending post; return whether it was deleted."""
+        with self.db:
+            row = self.db.execute("DELETE FROM posts WHERE id=? AND status='pending' RETURNING asset_id",
+                                  (post_id,)).fetchone()
+            if row is None:
+                return False
+            self._asset_status(row['asset_id'], 'available', reason='deleted')
+            self._cleanup()
+        return True
+
+    def replace_post(self, post_id, content):
+        """Replace a pending snapshot, optionally reserving content['asset_id']."""
+        with self.db:
+            # Acquire the write lock before reading, so another connection cannot
+            # claim the post between validation and replacement.
+            row = self.db.execute("UPDATE posts SET content=content WHERE id=? AND status='pending' RETURNING *",
+                                  (post_id,)).fetchone()
+            if row is None:
+                return False
+            aid = content.get('asset_id')
+            payload = json.dumps({k: v for k, v in content.items() if k != 'asset_id'})
+            if aid != row['asset_id']:
+                if aid is not None:
+                    changed = self.db.execute("""UPDATE assets SET status='pending',stamp=?,
+                        status_reason='replacement',dirty=1,revision=revision+1
+                        WHERE id=? AND status='available' AND content IS NOT NULL""",
+                        (row['due'], aid)).rowcount
+                    if not changed:
+                        raise ValueError('Asset is no longer available. Refresh the pool.')
+                self._asset_status(row['asset_id'], 'available', reason='replaced')
+            elif aid is not None:
+                self._asset_status(aid, 'pending', row['due'], reason='replacement')
+            self.db.execute('UPDATE posts SET content=?,asset_id=? WHERE id=?',
+                            (payload, aid, post_id))
+        return True
+
     def delete_schedule(self, schedule_id):
         with self.db:
             for row in self.db.execute("SELECT asset_id,status FROM posts WHERE schedule_id=? AND status!='sending'", (schedule_id,)).fetchall():
-                self._asset_status(row['asset_id'], 'uncertain' if row['status'] == 'uncertain' else 'available')
+                self._asset_status(row['asset_id'], 'uncertain' if row['status'] == 'uncertain' else 'available',
+                                                   reason='deleted')
             self.db.execute("DELETE FROM posts WHERE schedule_id=? AND status!='sending'", (schedule_id,))
             retained = self.db.execute('SELECT 1 FROM posts WHERE schedule_id=?', (schedule_id,)).fetchone() is not None
             self._cleanup()
@@ -168,9 +208,9 @@ class Store:
                 self._asset_status(row['asset_id'], status, row['due'] if status == 'pending' else None)
             self.db.execute('UPDATE posts SET status=?,error=? WHERE id=?', (status, str(error), post_id))
 
-    def _asset_status(self, asset_id, status, stamp=None):
-        self.db.execute('UPDATE assets SET status=?,stamp=?,dirty=1,revision=revision+1 WHERE id=?',
-                        (status, stamp, asset_id))
+    def _asset_status(self, asset_id, status, stamp=None, reason=None):
+        self.db.execute('UPDATE assets SET status=?,stamp=?,status_reason=?,dirty=1,revision=revision+1 WHERE id=?',
+                        (status, stamp, reason, asset_id))
 
     def add_asset(self, source_chat, source_ids, content, group_id=None):
         with self.db:
@@ -192,6 +232,38 @@ class Store:
             raise ValueError('Source matches multiple assets. Use Asset pool to select explicitly.')
         return matches[0] if matches else None
 
+    def update_asset_content(self, source_chat, source_id, content):
+        """Apply a source message edit; return False for unknown or unsafe assets.
+
+        Album edits accept a single-member media payload, not a whole album.
+        Only available/pending assets and pending scheduled snapshots are edited.
+        """
+        with self.db:
+            self.db.execute('UPDATE assets SET id=id WHERE source_chat=?', (str(source_chat),))
+            asset = self.asset_from_source(source_chat, source_id)
+            if not asset or asset['status'] not in ('available', 'pending') or not asset['content']:
+                return False
+            posts = self.db.execute('SELECT id,status,content FROM posts WHERE asset_id=?',
+                                    (asset['id'],)).fetchall()
+            if any(p['status'] != 'pending' for p in posts):
+                return False
+            original = json.loads(asset['content'])
+            index = json.loads(asset['source_ids']).index(source_id)
+
+            def edited(snapshot):
+                if original.get('kind') != 'album':
+                    return {k: v for k, v in content.items() if k != 'asset_id'}
+                if len(content.get('media', [])) != 1:
+                    raise ValueError('An album edit must contain exactly one media member.')
+                snapshot['media'][index] = content['media'][0]
+                return snapshot
+
+            updated = json.dumps(edited(original))
+            snapshots = [(json.dumps(edited(json.loads(p['content']))), p['id']) for p in posts]
+            self.db.execute('UPDATE assets SET content=? WHERE id=?', (updated, asset['id']))
+            self.db.executemany("UPDATE posts SET content=? WHERE id=? AND status='pending'", snapshots)
+        return True
+
     def asset_content(self, asset_id):
         row = self.db.execute("SELECT content FROM assets WHERE id=? AND status='available'", (asset_id,)).fetchone()
         if not row or not row[0]:
@@ -200,7 +272,7 @@ class Store:
 
     def release_uncertain(self, asset_id):
         with self.db:
-            self.db.execute("UPDATE assets SET status='available',stamp=NULL,dirty=1,revision=revision+1 WHERE id=? AND status='uncertain' AND NOT EXISTS (SELECT 1 FROM posts WHERE asset_id=assets.id)", (asset_id,))
+            self.db.execute("UPDATE assets SET status='available',stamp=NULL,status_reason=NULL,dirty=1,revision=revision+1 WHERE id=? AND status='uncertain' AND NOT EXISTS (SELECT 1 FROM posts WHERE asset_id=assets.id)", (asset_id,))
 
     def status_jobs(self):
         return [dict(r) for r in self.db.execute('''SELECT a.* FROM assets a

@@ -180,7 +180,11 @@ async def _show_posts(context, chat_id, posts, times=None):
         due = times[index] if times is not None else post["due"]
         content = post if times is not None else post["content"]
         status = "" if times is not None else f" · {post['status']}"
-        await context.bot.send_message(chat_id, f"{_stamp(due)}{status}")
+        markup = None
+        if times is None and post['status'] == 'pending':
+            markup = _keyboard([[("Delete post", f"post_delete:{post['id']}"),
+                                 ("Replace post", f"post_replace:{post['id']}")]])
+        await context.bot.send_message(chat_id, f"{_stamp(due)}{status}", reply_markup=markup)
         await send_content(context.bot, chat_id, content)
 
 
@@ -251,6 +255,9 @@ async def _message(update, context):
         await message.reply_text("Choose an action. Dates and times are UTC.", reply_markup=MENU)
         return
     if text == "Create schedule":
+        if context.user_data.get('replacement'):
+            await message.reply_text('Confirm or cancel the active replacement first.')
+            return
         if context.user_data.get("draft"):
             await message.reply_text("A draft already exists. Commit or Cancel it first.")
             draft = context.user_data["draft"]
@@ -283,6 +290,27 @@ async def _message(update, context):
         return
     if text == "Needs attention":
         await _attention(context, chat_id)
+        return
+    replacement = context.user_data.get('replacement')
+    if replacement:
+        origin = getattr(message, 'forward_origin', None)
+        pool_id = context.application.bot_data.get('pool_chat_id')
+        store = context.application.bot_data['store']
+        try:
+            if not isinstance(origin, MessageOriginChannel) or str(origin.chat.id) != str(pool_id):
+                raise ValueError('Forward an original post from the configured pool channel.')
+            asset = store.asset_from_source(origin.chat.id, origin.message_id)
+            if asset is None:
+                raise ValueError('Pool post is not stored yet. Wait for album ingestion and forward again.')
+            content = store.asset_content(asset['id'])
+        except ValueError as exc:
+            await message.reply_text(str(exc))
+            return
+        replacement['asset_id'] = asset['id']
+        await send_content(context.bot, chat_id, content)
+        await message.reply_text('Replace with this complete pool post? Posting time stays unchanged.',
+            reply_markup=_keyboard([[("Confirm replacement", f"replace_yes:{replacement['key']}:{asset['id']}"),
+                                      ("Cancel", f"replace_cancel:{replacement['key']}")]]))
         return
     draft = context.user_data.get("draft")
     if not draft:
@@ -414,6 +442,51 @@ async def _callback(update, context):
     parts = query.data.split(":")
     action = parts[0]
     store = context.application.bot_data["store"]
+    if action in ('post_delete', 'post_delete_yes', 'post_replace'):
+        pid = int(parts[1])
+        if action == 'post_delete':
+            await context.bot.send_message(chat_id, 'Remove this post from its schedule and release it for reuse?',
+                reply_markup=_keyboard([[("Delete post", f"post_delete_yes:{pid}"), ("Keep", 'noop')]]))
+        elif action == 'post_delete_yes':
+            changed = store.delete_post(pid)
+            await query.edit_message_reply_markup(reply_markup=None)
+            await context.bot.send_message(chat_id, 'Post removed; pool asset available again.' if changed else 'Post is no longer pending. Refresh schedules.')
+        else:
+            if context.user_data.get('draft'):
+                await context.bot.send_message(chat_id, 'Commit or cancel your draft before replacing a scheduled post.')
+                return
+            pending = next((p for s in store.list_schedules() for p in store.get_posts(s['id'])
+                            if p['id'] == pid and p['status'] == 'pending'), None)
+            if pending is None:
+                await context.bot.send_message(chat_id, 'Post is no longer pending. Refresh schedules.')
+                return
+            key = uuid.uuid4().hex[:12]
+            context.user_data['replacement'] = {'post_id': pid, 'key': key}
+            await context.bot.send_message(chat_id, f"Forward a replacement from the pool channel. Posting: {_stamp(pending['due'])}.",
+                reply_markup=_keyboard([[("Cancel replacement", f"replace_cancel:{key}")]]))
+        return
+    if action in ('replace_yes', 'replace_cancel'):
+        replacement = context.user_data.get('replacement')
+        if not replacement or replacement['key'] != parts[1]:
+            await context.bot.send_message(chat_id, 'This replacement is no longer active.')
+            return
+        if action == 'replace_cancel':
+            context.user_data.pop('replacement', None)
+            await context.bot.send_message(chat_id, 'Replacement cancelled.')
+        else:
+            aid = int(parts[2])
+            if replacement.get('asset_id') != aid:
+                await context.bot.send_message(chat_id, 'Use the latest replacement preview.')
+                return
+            try:
+                changed = store.replace_post(replacement['post_id'], store.asset_content(aid))
+            except ValueError as exc:
+                await context.bot.send_message(chat_id, str(exc))
+                return
+            context.user_data.pop('replacement', None)
+            await context.bot.send_message(chat_id, 'Post replaced; old pool asset available again. Posting time unchanged.' if changed else 'Post is no longer pending; nothing changed.')
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
     if action == 'asset':
         draft = context.user_data.get('draft')
         if not draft or draft['key'] != parts[1] or 'end' not in draft:
@@ -556,7 +629,8 @@ def register_handlers(application: Application, owner_id: int) -> None:
     application.add_handler(CallbackQueryHandler(guarded(_callback)))
     application.add_handler(MessageHandler(filters.UpdateType.MESSAGE, guarded(_message)))
     from pool import ingest
-    application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, ingest))
+    application.add_handler(MessageHandler(
+        filters.UpdateType.CHANNEL_POST | filters.UpdateType.EDITED_CHANNEL_POST, ingest))
 
 
 def build_application(token: str, owner_id: int, chat_id: Any, store: Any) -> Application:
