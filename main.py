@@ -12,6 +12,7 @@ from telegram.error import BadRequest, Forbidden, RetryAfter
 from telegram.ext import Application
 
 from bot import register_handlers, send_content
+from error_reporting import application_error
 from storage import Store
 
 log = logging.getLogger(__name__)
@@ -158,6 +159,7 @@ def main():
                         pool_chat_id=int(pool_id) if pool_id else None)
     if pool_id and (str(destination) == str(int(pool_id))):
         raise SystemExit('POOL_CHAT_ID must differ from CHAT_ID to avoid importing deliveries.')
+    app.add_error_handler(application_error)
     register_handlers(app, owner)
     asyncio.set_event_loop(asyncio.new_event_loop())
     try:

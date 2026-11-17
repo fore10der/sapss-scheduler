@@ -563,5 +563,7 @@ def build_application(token: str, owner_id: int, chat_id: Any, store: Any) -> Ap
     """Optional convenience factory. No environment reads and no worker startup."""
     application = Application.builder().token(token).concurrent_updates(False).build()
     application.bot_data.update(store=store, chat_id=chat_id)
+    from error_reporting import application_error
+    application.add_error_handler(application_error)
     register_handlers(application, owner_id)
     return application
