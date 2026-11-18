@@ -50,8 +50,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
                           '2026-11-20T14:30:59+02:30', '2026-11-20T12:00:00Z'):
                 with self.subTest(status=status, stamp=stamp):
                     self.assertEqual(marker({'id': 77, 'revision': 123, 'status': status, 'stamp': stamp}),
-                                     f'{expected} — 2026-11-20 12:00 UTC'
-                                     + ('\n#to_delete' if status == 'published' else ''))
+                                     f'{expected} — 2026-11-20 12:00 UTC')
         with self.assertRaises(ValueError):
             marker({'status': 'pending', 'stamp': '2026-11-20T12:00:00'})
 
@@ -96,7 +95,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             self.store.finish(post['id'])
         await maintain(self.app)
         self.assertEqual(self.app.bot.send_message.call_args.kwargs['text'],
-                         '✅ Published — 2026-11-20 12:00 UTC\n#to_delete')
+                         '✅ Published — 2026-11-20 12:00 UTC')
 
     async def test_human_reply_snapshot_survives_restart_and_new_revision(self):
         aid = self.add()
@@ -190,7 +189,9 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         await maintain(self.app)
         self.assertEqual(self.app.bot.send_message.call_args.kwargs['text'], marker(published))
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM asset_originals').fetchone()[0], 0)
-        self.app.bot.edit_message_caption.assert_not_awaited()
+        self.assertEqual(self.app.bot.edit_message_caption.await_count, 2)
+        self.assertEqual([call.kwargs['message_id'] for call in
+                          self.app.bot.edit_message_caption.await_args_list], [10, 11])
         self.app.bot.edit_message_text.assert_not_awaited()
         self.assertEqual(self.store.status_jobs(), [])
 

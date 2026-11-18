@@ -55,6 +55,24 @@ class Store:
             PRIMARY KEY(asset_id, revision));
         UPDATE status_notifications SET state='uncertain' WHERE state='sending';
         ''')
+        self.db.executescript('''
+        CREATE TABLE IF NOT EXISTS pool_mark_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_id INTEGER NOT NULL REFERENCES assets(id),
+            source_id INTEGER NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('text','photo')),
+            payload TEXT,
+            state TEXT NOT NULL DEFAULT 'pending'
+                CHECK(state IN ('pending','sending','done','failed','uncertain')),
+            error TEXT,
+            reported INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(asset_id, source_id));
+        CREATE INDEX IF NOT EXISTS pending_pool_marks ON pool_mark_jobs(state, id);
+        UPDATE pool_mark_jobs SET state='uncertain',
+            error='Process stopped during source marking' WHERE state='sending';
+        ''')
+        if 'reported' not in [r[1] for r in self.db.execute('PRAGMA table_info(pool_mark_jobs)')]:
+            self.db.execute('ALTER TABLE pool_mark_jobs ADD COLUMN reported INTEGER NOT NULL DEFAULT 0')
         if 'status_reason' not in [r[1] for r in self.db.execute('PRAGMA table_info(assets)')]:
             self.db.execute('ALTER TABLE assets ADD COLUMN status_reason TEXT')
         if 'text' not in [r[1] for r in self.db.execute('PRAGMA table_info(status_notifications)')]:
@@ -202,11 +220,20 @@ class Store:
 
     def finish(self, post_id):
         with self.db:
-            row = self.db.execute("SELECT asset_id FROM posts WHERE id=? AND status='sending'", (post_id,)).fetchone()
+            row = self.db.execute("DELETE FROM posts WHERE id=? AND status='sending' RETURNING asset_id", (post_id,)).fetchone()
             if row:
+                asset = self.db.execute('SELECT * FROM assets WHERE id=?', (row['asset_id'],)).fetchone()
+                if asset and asset['content']:
+                    original = json.loads(asset['content'])
+                    for index, source_id in enumerate(json.loads(asset['source_ids'])):
+                        kind = 'text' if original['kind'] == 'text' else 'photo'
+                        payload = original if kind == 'text' else {
+                            'kind': 'photo', 'media': [original['media'][index]]}
+                        self.db.execute('''INSERT OR IGNORE INTO pool_mark_jobs
+                            (asset_id,source_id,kind,payload) VALUES(?,?,?,?)''',
+                            (asset['id'], source_id, kind, json.dumps(payload)))
                 self._asset_status(row['asset_id'], 'published', datetime.now(UTC).isoformat())
                 self.db.execute("UPDATE assets SET content=NULL WHERE id=?", (row['asset_id'],))
-            self.db.execute("DELETE FROM posts WHERE id=? AND status='sending'", (post_id,))
             self._cleanup()
 
     def hold(self, post_id, status, error):
@@ -281,6 +308,44 @@ class Store:
     def release_uncertain(self, asset_id):
         with self.db:
             self.db.execute("UPDATE assets SET status='available',stamp=NULL,status_reason=NULL,dirty=1,revision=revision+1 WHERE id=? AND status='uncertain' AND NOT EXISTS (SELECT 1 FROM posts WHERE asset_id=assets.id)", (asset_id,))
+
+    def marking_jobs(self, state='pending'):
+        """List source marking work, or inspect failed/uncertain outcomes.
+
+        Payload is decoded original content (one photo per job), or None on done.
+        This queue is independent of status notifications and never ingests edits.
+        """
+        rows = self.db.execute('''SELECT j.*,a.source_chat FROM pool_mark_jobs j
+            JOIN assets a ON a.id=j.asset_id WHERE j.state=? ORDER BY j.id''', (state,))
+        return [{**dict(r), 'payload': json.loads(r['payload']) if r['payload'] else None}
+                for r in rows]
+
+    def claim_mark(self, job_id):
+        """Atomically claim pending work; never automatically retry uncertainty."""
+        with self.db:
+            return bool(self.db.execute("""UPDATE pool_mark_jobs SET state='sending',error=NULL
+                WHERE id=? AND state='pending'""", (job_id,)).rowcount)
+
+    def mark_result(self, job_id, state, error=None):
+        """Record a result, or explicitly retry with pending; done is terminal.
+
+        Failed/uncertain originals remain available for inspection and retry.
+        Return whether a nonterminal job was updated.
+        """
+        if state not in ('pending', 'done', 'failed', 'uncertain'):
+            raise ValueError('Invalid marking result state.')
+        with self.db:
+            return bool(self.db.execute('''UPDATE pool_mark_jobs SET state=?,error=?,
+                payload=CASE WHEN ?='done' THEN NULL ELSE payload END
+                WHERE id=? AND state!='done' ''',
+                (state, None if error is None else str(error), state, job_id)).rowcount)
+
+    def mark_reported(self, job_id):
+        """Acknowledge a failed/uncertain report only after owner send success."""
+        with self.db:
+            return bool(self.db.execute('''UPDATE pool_mark_jobs SET reported=1
+                WHERE id=? AND state IN ('failed','uncertain') AND reported=0''',
+                (job_id,)).rowcount)
 
     def status_jobs(self):
         return [dict(r) for r in self.db.execute('''SELECT a.* FROM assets a

@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
-from telegram import ReplyParameters
+from telegram import MessageEntity, ReplyParameters
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
 
 log = logging.getLogger(__name__)
@@ -87,7 +87,7 @@ def marker(job):
     if stamp.tzinfo is None:
         raise ValueError('Pool status timestamp must be timezone-aware')
     text = f"{label} — {stamp.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-    return text + '\n#to_delete' if job['status'] == 'published' else text
+    return text
 
 
 
@@ -135,9 +135,75 @@ async def maintain(app):
                             job['id'], type(exc).__name__)
         else:
             store.status_result(job['id'], job['revision'], 'sent', result.message_id)
+    await mark_published_sources(app)
     for job in store.uncertain_notifications():
         if await report_failure(app, job, None):
             store.notification_reported(job['id'], job['revision'])
+
+
+def marked_content(payload):
+    """Append the cleanup tag without changing original text or entity offsets."""
+    is_text = payload['kind'] == 'text'
+    item = payload if is_text else payload['media'][0]
+    original = item.get('text' if is_text else 'caption') or ''
+    value = original if original == '#to_delete' or original.endswith('\n\n#to_delete') else (
+        original + '\n\n#to_delete' if original else '#to_delete')
+    # Telegram entity offsets use UTF-16. Conservatively use the same units for limits.
+    if len(value.encode('utf-16-le')) // 2 > (4096 if is_text else 1024):
+        raise ValueError('Original content plus tag exceeds the Telegram limit')
+    entities = list(item.get('entities' if is_text else 'caption_entities') or [])
+    return value, entities
+
+
+async def mark_published_sources(app):
+    """Durable pool-only edits; failures never retry destination publication."""
+    store = app.bot_data['store']
+    for job in store.marking_jobs():
+        if not store.claim_mark(job['id']):
+            continue
+        try:
+            value, entities = marked_content(job['payload'])
+            entities = [MessageEntity.de_json(entity, app.bot) for entity in entities]
+            kwargs = dict(chat_id=int(job['source_chat']), message_id=job['source_id'],
+                          parse_mode=None, rate_limit_args={'priority': -10})
+            if job['kind'] == 'text':
+                await app.bot.edit_message_text(text=value, entities=entities, **kwargs)
+            else:
+                await app.bot.edit_message_caption(caption=value, caption_entities=entities, **kwargs)
+        except RetryAfter as exc:
+            store.mark_result(job['id'], 'pending', type(exc).__name__)
+            delay = exc.retry_after
+            await asyncio.sleep(delay.total_seconds() if hasattr(delay, 'total_seconds') else delay)
+            break
+        except BadRequest as exc:
+            if 'message is not modified' in str(exc).lower():
+                store.mark_result(job['id'], 'done')
+            else:
+                store.mark_result(job['id'], 'failed', type(exc).__name__)
+        except (Forbidden, ValueError) as exc:
+            store.mark_result(job['id'], 'failed', type(exc).__name__)
+        except asyncio.CancelledError:
+            store.mark_result(job['id'], 'uncertain', 'CancelledError')
+            raise
+        except Exception as exc:
+            store.mark_result(job['id'], 'uncertain', type(exc).__name__)
+        else:
+            store.mark_result(job['id'], 'done')
+    for state in ('failed', 'uncertain'):
+        for job in store.marking_jobs(state):
+            if job['reported']:
+                continue
+            try:
+                await app.bot.send_message(
+                    app.bot_data['owner_id'],
+                    f"Pool source marking {state}: asset #{job['asset_id']}, message #{job['source_id']} "
+                    f"({job['error']}). Destination publication succeeded and will not be retried. "
+                    'Check the source manually, caption/text length, and channel Edit messages permission. '
+                    'The tag edit will not be retried automatically.', parse_mode=None)
+            except Exception:
+                log.warning('Pool source marking report failed job_id=%s', job['id'])
+            else:
+                store.mark_reported(job['id'])
 
 
 async def report_failure(app, job, exc):
