@@ -14,3 +14,4 @@ secrets/
 secrets.*
 *.pem
 *.key
+.omp
