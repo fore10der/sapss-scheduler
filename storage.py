@@ -107,6 +107,61 @@ class Store:
     def _cleanup(self):
         self.db.execute('DELETE FROM schedules WHERE NOT EXISTS (SELECT 1 FROM posts WHERE schedule_id=schedules.id)')
 
+    @staticmethod
+    def _snapshot(content):
+        return {key: value for key, value in content.items()
+                if key not in ('asset_id', 'source', 'source_chat', 'source_ids')}
+
+    @classmethod
+    def _draft_source(cls, post):
+        """Read a draft post's source reference without persisting it in content."""
+        source = post.pop('source', None)
+        if source is None and 'source_chat' in post and 'source_ids' in post:
+            source = {'chat_id': post.pop('source_chat'),
+                      'message_ids': post.pop('source_ids')}
+        return source
+
+    def _claim_source(self, source_chat, source_ids, content, due, post_id=None):
+        """Create or reuse one tracked source record and reserve it as pending.
+
+        Only Commit and confirmed replacements call this; drafts and previews
+        remain in memory. Raises ValueError when the same pool source already
+        belongs to another queue entry.
+        """
+        ids = sorted({int(value) for value in source_ids})
+        if not ids:
+            raise ValueError('Forwarded pool source is missing message IDs.')
+        source_chat = str(source_chat)
+        snapshot = self._snapshot(content)
+        row = self.db.execute(
+            'SELECT * FROM assets WHERE source_chat=? AND source_ids=?',
+            (source_chat, json.dumps(ids))).fetchone()
+        if row is None:
+            for candidate in self.db.execute(
+                    'SELECT * FROM assets WHERE source_chat=?', (source_chat,)):
+                if set(json.loads(candidate['source_ids'])) == set(ids):
+                    row = candidate
+                    break
+        if row is None:
+            cur = self.db.execute(
+                'INSERT INTO assets(source_chat,source_ids,content) VALUES(?,?,?)',
+                (source_chat, json.dumps(ids), json.dumps(snapshot)))
+            aid = cur.lastrowid
+        else:
+            aid = row['id']
+            active = self.db.execute(
+                'SELECT id FROM posts WHERE asset_id=?', (aid,)).fetchone()
+            if active is not None and active['id'] != post_id:
+                raise ValueError(
+                    'This pool source is already scheduled. Delete or replace that post first.')
+            self.db.execute(
+                'UPDATE assets SET source_ids=?,content=?,group_id=NULL WHERE id=?',
+                (json.dumps(ids), json.dumps(snapshot), aid))
+        self.db.execute(
+            "UPDATE assets SET status='pending',stamp=?,status_reason=NULL,dirty=1,"
+            'revision=revision+1 WHERE id=?', (due, aid))
+        return aid
+
     def create_schedule(self, chat_id, start, end, posts):
         if start <= datetime.now(UTC):
             raise ValueError('Start must still be in the future.')
@@ -116,13 +171,20 @@ class Store:
                                   (str(chat_id), start.isoformat(), end.isoformat()))
             sid = cur.lastrowid
             for t, p in zip(times, posts):
-                aid = p.get('asset_id')
-                if aid is not None:
+                p = dict(p)
+                source = self._draft_source(p)
+                aid = p.pop('asset_id', None)
+                if source is not None:
+                    try:
+                        aid = self._claim_source(
+                            source['chat_id'], source['message_ids'], p, t.isoformat())
+                    except (KeyError, TypeError):
+                        raise ValueError('Forwarded pool source is incomplete.') from None
+                elif aid is not None:
                     changed = self.db.execute("UPDATE assets SET status='pending',stamp=?,status_reason=NULL,dirty=1,revision=revision+1 WHERE id=? AND status='available' AND content IS NOT NULL",
                                               (t.isoformat(), aid)).rowcount
                     if not changed:
                         raise ValueError('Asset is no longer available. Refresh the pool.')
-                p = {key: value for key, value in p.items() if key != 'asset_id'}
                 self.db.execute('INSERT INTO posts(schedule_id,due,content,asset_id) VALUES(?,?,?,?)',
                                 (sid, t.isoformat(), json.dumps(p), aid))
         return sid
@@ -153,7 +215,7 @@ class Store:
         return True
 
     def replace_post(self, post_id, content):
-        """Replace a pending snapshot, optionally reserving content['asset_id']."""
+        """Replace a pending snapshot; new source tracking starts in this transaction."""
         with self.db:
             # Acquire the write lock before reading, so another connection cannot
             # claim the post between validation and replacement.
@@ -161,21 +223,32 @@ class Store:
                                   (post_id,)).fetchone()
             if row is None:
                 return False
+            content = dict(content)
+            source = self._draft_source(content)
             aid = content.get('asset_id')
-            payload = json.dumps({k: v for k, v in content.items() if k != 'asset_id'})
+            payload = self._snapshot(content)
+            if source is not None:
+                try:
+                    aid = self._claim_source(source['chat_id'], source['message_ids'],
+                                             payload, row['due'], post_id=row['id'])
+                except (KeyError, TypeError):
+                    raise ValueError('Forwarded pool source is incomplete.') from None
+                if aid != row['asset_id']:
+                    self._asset_status(aid, 'pending', row['due'], reason='replacement')
             if aid != row['asset_id']:
-                if aid is not None:
+                if aid is not None and source is None:
                     changed = self.db.execute("""UPDATE assets SET status='pending',stamp=?,
                         status_reason='replacement',dirty=1,revision=revision+1
                         WHERE id=? AND status='available' AND content IS NOT NULL""",
                         (row['due'], aid)).rowcount
                     if not changed:
                         raise ValueError('Asset is no longer available. Refresh the pool.')
-                self._asset_status(row['asset_id'], 'available', reason='replaced')
+                if row['asset_id'] is not None:
+                    self._asset_status(row['asset_id'], 'available', reason='replaced')
             elif aid is not None:
                 self._asset_status(aid, 'pending', row['due'], reason='replacement')
             self.db.execute('UPDATE posts SET content=?,asset_id=? WHERE id=?',
-                            (payload, aid, post_id))
+                            (json.dumps(payload), aid, post_id))
         return True
 
     def delete_schedule(self, schedule_id):
@@ -264,40 +337,51 @@ class Store:
             'SELECT * FROM assets WHERE source_chat=?', (str(source_chat),))
             if source_id in json.loads(row['source_ids'])]
         if len(matches) > 1:
-            raise ValueError('Source matches multiple assets. Use Asset pool to select explicitly.')
+            raise ValueError('Source matches multiple tracked records. Forward it again instead.')
         return matches[0] if matches else None
 
     def update_asset_content(self, source_chat, source_id, content):
-        """Apply a source message edit; return False for unknown or unsafe assets.
+        """Apply a source message edit to every tracked record containing it.
 
         Album edits accept a single-member media payload, not a whole album.
         Only available/pending assets and pending scheduled snapshots are edited.
+        Source updates never create a new tracked record.
         """
         with self.db:
             self.db.execute('UPDATE assets SET id=id WHERE source_chat=?', (str(source_chat),))
-            asset = self.asset_from_source(source_chat, source_id)
-            if not asset or asset['status'] not in ('available', 'pending') or not asset['content']:
-                return False
-            posts = self.db.execute('SELECT id,status,content FROM posts WHERE asset_id=?',
-                                    (asset['id'],)).fetchall()
-            if any(p['status'] != 'pending' for p in posts):
-                return False
-            original = json.loads(asset['content'])
-            index = json.loads(asset['source_ids']).index(source_id)
+            updated_any = False
+            for asset in self.db.execute('SELECT * FROM assets WHERE source_chat=?',
+                                         (str(source_chat),)).fetchall():
+                if (asset['status'] not in ('available', 'pending')
+                        or not asset['content']):
+                    continue
+                source_ids = json.loads(asset['source_ids'])
+                if source_id not in source_ids:
+                    continue
+                posts = self.db.execute('SELECT id,status,content FROM posts WHERE asset_id=?',
+                                        (asset['id'],)).fetchall()
+                if any(p['status'] != 'pending' for p in posts):
+                    continue
+                original = json.loads(asset['content'])
+                index = source_ids.index(source_id)
 
-            def edited(snapshot):
-                if original.get('kind') != 'album':
-                    return {k: v for k, v in content.items() if k != 'asset_id'}
-                if len(content.get('media', [])) != 1:
-                    raise ValueError('An album edit must contain exactly one media member.')
-                snapshot['media'][index] = content['media'][0]
-                return snapshot
+                def edited(snapshot):
+                    if original.get('kind') != 'album':
+                        return self._snapshot(content)
+                    if len(content.get('media', [])) != 1:
+                        raise ValueError('An album edit must contain exactly one media member.')
+                    snapshot['media'][index] = content['media'][0]
+                    return snapshot
 
-            updated = json.dumps(edited(original))
-            snapshots = [(json.dumps(edited(json.loads(p['content']))), p['id']) for p in posts]
-            self.db.execute('UPDATE assets SET content=? WHERE id=?', (updated, asset['id']))
-            self.db.executemany("UPDATE posts SET content=? WHERE id=? AND status='pending'", snapshots)
-        return True
+                updated = json.dumps(edited(original))
+                snapshots = [(json.dumps(edited(json.loads(p['content']))), p['id'])
+                             for p in posts]
+                self.db.execute('UPDATE assets SET content=? WHERE id=?',
+                                (updated, asset['id']))
+                self.db.executemany("UPDATE posts SET content=? WHERE id=? AND status='pending'",
+                                    snapshots)
+                updated_any = True
+        return updated_any
 
     def asset_content(self, asset_id):
         row = self.db.execute("SELECT content FROM assets WHERE id=? AND status='available'", (asset_id,)).fetchone()

@@ -1,4 +1,8 @@
-"""Pool ingestion and independent, durable status replies. No delivery calls."""
+"""Tracked-source updates and durable status replies. No delivery calls.
+
+New channel posts are deliberately not imported: pool sources become tracked
+records only when the owner commits a forwarded draft or replacement.
+"""
 import asyncio
 import json
 import logging
@@ -26,6 +30,12 @@ def content_of(message):
 
 
 async def ingest(update, context):
+    """Process pool-channel updates needed by existing tracked sources.
+
+    New posts are not imported. Edits refresh snapshots for available/pending
+    tracked sources and their linked pending queue entries; they never create a
+    tracked record. Status replies and the reserved startup notice are ignored.
+    """
     edited = getattr(update, 'edited_channel_post', None)
     message = edited or getattr(update, 'channel_post', None)
     data = context.application.bot_data
@@ -40,37 +50,12 @@ async def ingest(update, context):
             message.chat_id, reply.message_id if reply else None,
             getattr(message, 'text', None), message.message_id):
         return
+    if not edited:
+        return
     content = content_of(message)
     if not content:
         return
-    if edited:
-        data['store'].update_asset_content(message.chat_id, message.message_id, content)
-        return
-    if not message.media_group_id:
-        data['store'].add_asset(message.chat_id, [message.message_id], content)
-        return
-    groups = data.setdefault('pool_groups', {})
-    key = (message.chat_id, message.media_group_id)
-    pending = groups.setdefault(key, {'items': {}})
-    if 'task' in pending:
-        pending['task'].cancel()
-    pending['items'][message.message_id] = content['media'][0]
-
-    async def flush():
-        await asyncio.sleep(1.5)
-        try:
-            items = sorted(pending['items'].items())
-            data['store'].add_asset(key[0], [mid for mid, _ in items],
-                                   {'kind': 'album', 'media': [item for _, item in items]}, key[1])
-        except Exception as exc:
-            log.warning('Pool album ingestion failed error_type=%s', type(exc).__name__)
-            try:
-                await context.bot.send_message(data['owner_id'], 'Could not store an incoming pool album. Check storage and the pool before scheduling.')
-            except Exception:
-                log.warning('Pool album ingestion report failed')
-        finally:
-            groups.pop(key, None)
-    pending['task'] = asyncio.create_task(flush())
+    data['store'].update_asset_content(message.chat_id, message.message_id, content)
 
 
 def marker(job):

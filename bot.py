@@ -12,7 +12,6 @@ synchronous. The storage module must also export schedule_times(start, end, coun
 """
 
 import asyncio
-import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -34,7 +33,7 @@ import storage
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
 MENU = ReplyKeyboardMarkup(
-    [["Create schedule", "View schedules"], ["Needs attention", "Asset pool"]], resize_keyboard=True
+    [["Create schedule", "View schedules"], ["Needs attention"]], resize_keyboard=True
 )
 
 
@@ -129,6 +128,27 @@ def _clear(context):
     context.user_data.pop("step", None)
 
 
+def _pool_source(origin, message_ids):
+    return {"chat_id": str(origin.chat.id), "message_ids": list(message_ids)}
+
+
+def _draft_source_ids(draft):
+    ids = set()
+    for post in draft["posts"]:
+        ids.update((post.get("source") or {}).get("message_ids", []))
+    for pending in draft["pending"].values():
+        ids.update(pending.get("items", {}))
+    return ids
+
+
+def _cancel_replacement_pending(replacement):
+    for pending in replacement.get("pending", {}).values():
+        task = pending.get("task")
+        if task is not None:
+            task.cancel()
+    replacement["pending"] = {}
+
+
 async def _summary(context, chat_id):
     draft = context.user_data.get("draft")
     if not draft or "end" not in draft:
@@ -162,14 +182,19 @@ async def _album_flush(context, chat_id, draft, group_id):
         if context.user_data.get("draft") is not draft:
             return
         pending = draft["pending"].pop(group_id)
-        if 'asset_id' in pending:
-            detail = f"Pool asset #{pending['asset_id']}: received captions preserved; full album selected."
+        items = sorted(pending["items"].items())
+        pending["post"]["media"] = [item for _, item in items]
+        if "source_chat" in pending:
+            pending["post"]["source"] = {
+                "chat_id": str(pending["source_chat"]),
+                "message_ids": [source_id for source_id, _ in items],
+            }
+            detail = ("Forwarded pool album accepted. Source tracking starts only when you Commit; "
+                      "only received members will be scheduled.")
         else:
-            # Standalone albums use private message order; linked albums retain
-            # source order and replace only the exact forwarded source members.
-            pending['post']['media'] = [item for _, item in sorted(pending['items'].items())]
-            detail = 'Standalone post, not linked to a pool asset. For pool tracking use Asset pool → Add to draft.'
-        await context.bot.send_message(chat_id, f"Accepted album: {len(pending['post']['media'])} photos. {detail}")
+            detail = "Standalone album; no pool source will be tracked."
+        await context.bot.send_message(
+            chat_id, f"Accepted album: {len(items)} photos. {detail}")
         await _summary(context, chat_id)
     except asyncio.CancelledError:
         pass
@@ -179,6 +204,41 @@ async def _album_flush(context, chat_id, draft, group_id):
             await context.bot.send_message(chat_id, "Could not update the album summary. Use Preview to inspect your draft.")
         except Exception:
             logger.exception("Failed to notify owner about album error")
+
+
+async def _replacement_album_flush(context, chat_id, replacement, group_id):
+    try:
+        await asyncio.sleep(1.5)
+        if context.user_data.get("replacement") is not replacement:
+            return
+        pending = replacement["pending"].pop(group_id, None)
+        if pending is None:
+            return
+        items = sorted(pending["items"].items())
+        content = {"kind": "album", "text": "", "entities": [],
+                   "media": [item for _, item in items]}
+        replacement["content"] = content
+        replacement["source"] = {
+            "chat_id": str(pending["source_chat"]),
+            "message_ids": [source_id for source_id, _ in items],
+        }
+        await send_content(context.bot, chat_id, content)
+        await context.bot.send_message(
+            chat_id,
+            "Replace with this forwarded album? Only received members will be scheduled. "
+            "Posting time stays unchanged.",
+            reply_markup=_keyboard([
+                [("Confirm replacement", f"replace_yes:{replacement['key']}"),
+                 ("Cancel", f"replace_cancel:{replacement['key']}")]]))
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Failed to finish replacement album")
+        try:
+            await context.bot.send_message(
+                chat_id, "Could not update the replacement preview. Forward again or cancel.")
+        except Exception:
+            logger.exception("Failed to notify owner about replacement album error")
 
 
 async def _show_posts(context, chat_id, posts, times=None):
@@ -257,10 +317,11 @@ async def _message(update, context):
     message = update.effective_message
     chat_id = message.chat_id
     text = message.text or ""
-    if text == "/start":
+    forwarded = getattr(message, 'forward_origin', None) is not None
+    if not forwarded and text == "/start":
         await message.reply_text("Choose an action. Dates and times are UTC.", reply_markup=MENU)
         return
-    if text == "Create schedule":
+    if not forwarded and text == "Create schedule":
         if context.user_data.get('replacement'):
             await message.reply_text('Confirm or cancel the active replacement first.')
             return
@@ -275,47 +336,62 @@ async def _message(update, context):
         context.user_data["step"] = "start"
         await message.reply_text("Enter the future start in UTC: YYYY-MM-DD HH:mm", reply_markup=_draft_keyboard(context.user_data["draft"]))
         return
-    if text == "View schedules":
+    if not forwarded and text == "View schedules":
         await _list(context, chat_id)
         return
-    if text == "Asset pool":
-        store = context.application.bot_data['store']
-        available = store.assets()
-        await message.reply_text(f"Available assets: {len(available)}. Create a draft window first, then add multiple assets here.")
-        for asset in available:
-            content = store.asset_content(asset['id'])
-            metadata = f"Asset #{asset['id']} · {content['kind']} · {asset['status']}"
-            if content['kind'] == 'album':
-                metadata += f" · {len(content['media'])} photos"
-            draft = context.user_data.get('draft')
-            markup = (_keyboard([[("Add to draft", f"asset:{draft['key']}:{asset['id']}")]])
-                      if draft and 'end' in draft else None)
-            await message.reply_text(metadata, reply_markup=markup)
-        for asset in store.assets('uncertain'):
-            await message.reply_text(f"Asset #{asset['id']} is uncertain. Check the destination before reuse. Active queue entries must be dismissed first.", reply_markup=_keyboard([[("Review reuse risk", f"release:{asset['id']}")]]))
-        return
-    if text == "Needs attention":
+    if not forwarded and text == "Needs attention":
         await _attention(context, chat_id)
         return
     replacement = context.user_data.get('replacement')
     if replacement:
         origin = getattr(message, 'forward_origin', None)
         pool_id = context.application.bot_data.get('pool_chat_id')
-        store = context.application.bot_data['store']
-        try:
-            if not isinstance(origin, MessageOriginChannel) or str(origin.chat.id) != str(pool_id):
-                raise ValueError('Forward an original post from the configured pool channel.')
-            asset = store.asset_from_source(origin.chat.id, origin.message_id)
-            if asset is None:
-                raise ValueError('Pool post is not stored yet. Wait for album ingestion and forward again.')
-            content = store.asset_content(asset['id'])
-        except ValueError as exc:
-            await message.reply_text(str(exc))
+        if not isinstance(origin, MessageOriginChannel):
+            await message.reply_text(
+                'Forward an original post from the configured pool channel with attribution intact.')
             return
-        replacement['asset_id'] = asset['id']
-        await send_content(context.bot, chat_id, content)
-        await message.reply_text('Replace with this complete pool post? Posting time stays unchanged.',
-            reply_markup=_keyboard([[("Confirm replacement", f"replace_yes:{replacement['key']}:{asset['id']}"),
+        if pool_id is None:
+            await message.reply_text(
+                'Pool forwarding is disabled because POOL_CHAT_ID is not configured. '
+                'Set it before replacing pool-sourced posts.')
+            return
+        if str(origin.chat.id) != str(pool_id):
+            await message.reply_text(
+                'Forward an original post from the configured pool channel with attribution intact.')
+            return
+        from pool import content_of
+        incoming = content_of(message)
+        if incoming is None:
+            await message.reply_text('Only text and photos are supported.')
+            return
+        gid = message.media_group_id
+        if gid is not None:
+            if incoming['kind'] != 'photo':
+                await message.reply_text('Only photo albums are supported.')
+                return
+            pending = replacement['pending'].get(gid)
+            if pending is None:
+                _cancel_replacement_pending(replacement)
+                replacement['content'] = None
+                replacement['source'] = None
+                pending = {'items': {}, 'source_chat': str(origin.chat.id)}
+                replacement['pending'][gid] = pending
+            if pending['source_chat'] != str(origin.chat.id):
+                await message.reply_text('This album is already receiving posts from another source.')
+                return
+            pending['items'][origin.message_id] = incoming['media'][0]
+            task = pending.get('task')
+            if task is not None:
+                task.cancel()
+            pending['task'] = asyncio.create_task(
+                _replacement_album_flush(context, chat_id, replacement, gid))
+            return
+        _cancel_replacement_pending(replacement)
+        replacement['content'] = incoming
+        replacement['source'] = _pool_source(origin, [origin.message_id])
+        await send_content(context.bot, chat_id, incoming)
+        await message.reply_text('Replace with this forwarded post? Posting time stays unchanged.',
+            reply_markup=_keyboard([[("Confirm replacement", f"replace_yes:{replacement['key']}"),
                                       ("Cancel", f"replace_cancel:{replacement['key']}")]]))
         return
     draft = context.user_data.get("draft")
@@ -344,62 +420,79 @@ async def _message(update, context):
         return
     origin = getattr(message, 'forward_origin', None)
     pool_id = context.application.bot_data.get('pool_chat_id')
-    if isinstance(origin, MessageOriginChannel) and pool_id is not None and str(origin.chat.id) == str(pool_id):
-        store = context.application.bot_data['store']
-        try:
-            asset = store.asset_from_source(origin.chat.id, origin.message_id)
-            if asset is None:
-                raise ValueError('Pool source is not stored yet (or was never imported). Wait for album ingestion, then use Asset pool → Add to draft.')
-            aid = asset['id']
-            pending = draft['pending'].get(message.media_group_id) if message.media_group_id else None
-            continuing = pending is not None and pending.get('asset_id') == aid
-            if any(post.get('asset_id') == aid for post in draft['posts']) and not continuing:
-                await message.reply_text(f"Asset #{aid} is already selected in this draft; not added again.")
+    gid = getattr(message, 'media_group_id', None)
+    pending = draft['pending'].get(gid) if gid else None
+    if isinstance(origin, MessageOriginChannel):
+        if pool_id is None:
+            await message.reply_text(
+                'Not added: pool forwarding is disabled because POOL_CHAT_ID is not configured. '
+                'Send an original upload for a standalone post.')
+            return
+        if str(origin.chat.id) != str(pool_id):
+            await message.reply_text(
+                'Not added: this forward is not attributed to the configured pool channel. '
+                'Forward the original from POOL_CHAT_ID with attribution intact.')
+            return
+        from pool import content_of
+        incoming = content_of(message)
+        if incoming is None:
+            await message.reply_text('Not added: only text and photos are supported.')
+            return
+        source_chat = str(origin.chat.id)
+        if pending is not None and 'source_chat' not in pending:
+            await message.reply_text(
+                'Not added: this album already contains standalone uploads. '
+                'Cancel the draft album before mixing forwarded pool posts.')
+            return
+        if pending is not None:
+            if incoming['kind'] != 'photo':
+                await message.reply_text('Not added: pool album sources must be forwarded as photos.')
                 return
-            from pool import content_of
-            incoming = content_of(message)
-            if incoming is None:
-                raise ValueError('Only text and photos are supported.')
-            if not continuing:
-                storage.schedule_times(draft['start'], draft['end'], len(draft['posts']) + 1)
-                post = store.asset_content(aid)
-            else:
-                post = pending['post']
-            if post['kind'] == 'album':
-                if incoming['kind'] != 'photo':
-                    raise ValueError('An album source must be forwarded as a photo.')
-                index = json.loads(asset['source_ids']).index(origin.message_id)
-                post['media'][index] = incoming['media'][0]
-            else:
-                post = {**incoming, 'asset_id': aid}
-        except ValueError as exc:
-            await message.reply_text(f"Not added: {exc} Use Asset pool to review availability.")
-            return
-        if not continuing:
-            draft['posts'].append(post)
-        if post['kind'] == 'album' and message.media_group_id:
-            gid = message.media_group_id
-            if continuing:
-                pending['task'].cancel()
-            else:
-                pending = {'post': post, 'asset_id': aid}
-                draft['pending'][gid] = pending
+            pending['items'][origin.message_id] = incoming['media'][0]
+            pending['post']['media'] = [item for _, item in sorted(pending['items'].items())]
+            pending['task'].cancel()
             pending['task'] = asyncio.create_task(_album_flush(context, chat_id, draft, gid))
-            if not continuing:
-                await message.reply_text(f"Selected pool asset #{aid}. Full album selected; receiving forwarded captions. Wait, then use Preview before Commit.")
             return
-        detail = ' Full album selected; received photo/caption preserved, unforwarded members unchanged.' if post['kind'] == 'album' else ' Received text/caption and formatting preserved.'
-        await message.reply_text(f"Selected pool asset #{aid}.{detail} Use Preview to inspect it; Commit reserves it.")
+        if origin.message_id in _draft_source_ids(draft):
+            await message.reply_text('This pool source is already in the draft; not added again.')
+            return
+        try:
+            storage.schedule_times(draft['start'], draft['end'], len(draft['posts']) + 1)
+        except ValueError:
+            await message.reply_text("Not accepted: posts must be at least one minute apart. Undo a post or use a wider window.")
+            return
+        if gid is not None:
+            if incoming['kind'] != 'photo':
+                await message.reply_text("Only photo albums are supported; non-photo album items were not added.")
+                return
+            post = {"kind": "album", "text": "", "entities": [], "media": []}
+            draft['posts'].append(post)
+            pending = {"post": post, "items": {origin.message_id: incoming['media'][0]},
+                       "source_chat": source_chat}
+            draft['pending'][gid] = pending
+            pending['post']['media'] = [item for _, item in sorted(pending['items'].items())]
+            pending['task'] = asyncio.create_task(_album_flush(context, chat_id, draft, gid))
+            await message.reply_text(
+                'Accepted forwarded pool album member(s). Receiving the album; only forwarded members will be scheduled.')
+            return
+        post = {**incoming, 'source': _pool_source(origin, [origin.message_id])}
+        draft['posts'].append(post)
+        await message.reply_text(
+            'Accepted pool forward. Source tracking starts only when you Commit. '
+            'Preview to inspect the content and formatting.')
         await _summary(context, chat_id)
         return
-    if origin is not None and getattr(origin, 'type', None) == 'hidden_user':
-        await message.reply_text('Not added: Telegram hid the forwarding source, so no pool asset can be identified safely. Use Asset pool → Add to draft for a pool asset, or send an original upload for a standalone post.')
+    if origin is not None:
+        await message.reply_text(
+            'Not added: Telegram did not attribute this forward to the configured pool channel. '
+            'Forward the original from POOL_CHAT_ID, or send an original upload for a standalone post.')
         return
-    pending = draft['pending'].get(message.media_group_id) if message.media_group_id else None
-    if pending is not None and 'asset_id' in pending:
-        await message.reply_text('This album item has no matching pool source attribution and was not added. Its stored original is unchanged. Use Preview to review the full album before Commit.')
+    if pending is not None and 'source_chat' in pending:
+        await message.reply_text(
+            'This album is receiving forwarded pool posts; unattributed items were not added. '
+            'Forward every album member from the pool channel.')
         return
-    if not (message.media_group_id and message.media_group_id in draft["pending"]):
+    if not (gid and gid in draft["pending"]):
         try:
             storage.schedule_times(draft["start"], draft["end"], len(draft["posts"]) + 1)
         except ValueError:
@@ -411,8 +504,7 @@ async def _message(update, context):
             "caption": message.caption or "",
             "caption_entities": [entity.to_dict() for entity in (message.caption_entities or [])],
         }
-        if message.media_group_id:
-            gid = message.media_group_id
+        if gid:
             pending = draft["pending"].get(gid)
             if pending:
                 pending["task"].cancel()
@@ -426,7 +518,7 @@ async def _message(update, context):
             pending["task"] = asyncio.create_task(_album_flush(context, chat_id, draft, gid))
             return
         post = {"kind": "photo", "text": "", "entities": [], "media": [item]}
-    elif message.media_group_id:
+    elif gid:
         await message.reply_text("Only photo albums are supported; non-photo album items were not added.")
         return
     elif message.text:
@@ -437,7 +529,8 @@ async def _message(update, context):
         return
     draft["posts"].append(post)
     await message.reply_text(("Accepted text post." if post["kind"] == "text" else "Accepted photo post.") +
-                             ' Standalone post, not linked to a pool asset. For pool tracking use Asset pool → Add to draft.')
+                             ' Standalone post; no pool source is tracked. '
+                             'Forward a pool original to track its status follow-up.')
     await _summary(context, chat_id)
 
 
@@ -448,15 +541,20 @@ async def _callback(update, context):
     parts = query.data.split(":")
     action = parts[0]
     store = context.application.bot_data["store"]
+    if action in ('asset', 'release', 'release_yes'):
+        await context.bot.send_message(
+            chat_id, 'Asset pool selection was removed. Forward an original from the pool channel '
+                     'into your draft instead.')
+        return
     if action in ('post_delete', 'post_delete_yes', 'post_replace'):
         pid = int(parts[1])
         if action == 'post_delete':
-            await context.bot.send_message(chat_id, 'Remove this post from its schedule and release it for reuse?',
+            await context.bot.send_message(chat_id, 'Remove this post from its schedule? Its tracked source, if any, becomes available again.',
                 reply_markup=_keyboard([[("Delete post", f"post_delete_yes:{pid}"), ("Keep", 'noop')]]))
         elif action == 'post_delete_yes':
             changed = store.delete_post(pid)
             await query.edit_message_reply_markup(reply_markup=None)
-            await context.bot.send_message(chat_id, 'Post removed; pool asset available again.' if changed else 'Post is no longer pending. Refresh schedules.')
+            await context.bot.send_message(chat_id, 'Post removed.' if changed else 'Post is no longer pending. Refresh schedules.')
         else:
             if context.user_data.get('draft'):
                 await context.bot.send_message(chat_id, 'Commit or cancel your draft before replacing a scheduled post.')
@@ -467,7 +565,9 @@ async def _callback(update, context):
                 await context.bot.send_message(chat_id, 'Post is no longer pending. Refresh schedules.')
                 return
             key = uuid.uuid4().hex[:12]
-            context.user_data['replacement'] = {'post_id': pid, 'key': key}
+            context.user_data['replacement'] = {
+                'post_id': pid, 'key': key, 'pending': {},
+                'content': None, 'source': None}
             await context.bot.send_message(chat_id, f"Forward a replacement from the pool channel. Posting: {_stamp(pending['due'])}.",
                 reply_markup=_keyboard([[("Cancel replacement", f"replace_cancel:{key}")]]))
         return
@@ -477,46 +577,25 @@ async def _callback(update, context):
             await context.bot.send_message(chat_id, 'This replacement is no longer active.')
             return
         if action == 'replace_cancel':
+            _cancel_replacement_pending(replacement)
             context.user_data.pop('replacement', None)
             await context.bot.send_message(chat_id, 'Replacement cancelled.')
         else:
-            aid = int(parts[2])
-            if replacement.get('asset_id') != aid:
-                await context.bot.send_message(chat_id, 'Use the latest replacement preview.')
+            content = replacement.get('content')
+            source = replacement.get('source')
+            if not content or not source:
+                await context.bot.send_message(chat_id, 'Forward a complete replacement first.')
                 return
             try:
-                changed = store.replace_post(replacement['post_id'], store.asset_content(aid))
+                changed = store.replace_post(
+                    replacement['post_id'], {**content, 'source': source})
             except ValueError as exc:
                 await context.bot.send_message(chat_id, str(exc))
                 return
+            _cancel_replacement_pending(replacement)
             context.user_data.pop('replacement', None)
-            await context.bot.send_message(chat_id, 'Post replaced; old pool asset available again. Posting time unchanged.' if changed else 'Post is no longer pending; nothing changed.')
+            await context.bot.send_message(chat_id, 'Post replaced; tracked source saved. Posting time unchanged.' if changed else 'Post is no longer pending; nothing changed.')
         await query.edit_message_reply_markup(reply_markup=None)
-        return
-    if action == 'asset':
-        draft = context.user_data.get('draft')
-        if not draft or draft['key'] != parts[1] or 'end' not in draft:
-            await context.bot.send_message(chat_id, 'This draft is no longer active or has no window.')
-            return
-        aid = int(parts[2])
-        if any(p.get('asset_id') == aid for p in draft['posts']):
-            await context.bot.send_message(chat_id, 'Already selected in this draft.')
-            return
-        try:
-            storage.schedule_times(draft['start'], draft['end'], len(draft['posts']) + 1)
-            draft['posts'].append(store.asset_content(aid))
-        except ValueError as exc:
-            await context.bot.send_message(chat_id, str(exc))
-            return
-        await _summary(context, chat_id)
-        return
-    if action in ('release', 'release_yes'):
-        aid = int(parts[1])
-        if action == 'release':
-            await context.bot.send_message(chat_id, 'This asset may already be published. Reusing it risks a duplicate. Confirm only after checking the destination.', reply_markup=_keyboard([[("Accept duplicate risk", f"release_yes:{aid}"), ("Keep blocked", 'noop')]]))
-        else:
-            store.release_uncertain(aid)
-            await context.bot.send_message(chat_id, 'Reuse confirmation recorded if no active queue entry remains. Refresh Asset pool.')
         return
     if action == "draft":
         draft = context.user_data.get("draft")
@@ -584,7 +663,7 @@ async def _callback(update, context):
     elif action == "delete_yes":
         retained = store.delete_schedule(identifier)
         await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(chat_id, "Schedule deleted. In-flight sending rows were retained." if retained else "Schedule deleted (or already absent). Uncertain pool assets remain blocked; review Asset pool before reuse.")
+        await context.bot.send_message(chat_id, "Schedule deleted. In-flight sending rows were retained." if retained else "Schedule deleted (or already absent).")
     elif action in ("dismiss", "retry", "retry_yes"):
         # Old attention buttons must not resolve a post now queued or sending.
         post = next((post for post in store.attention() if post["id"] == identifier), None)
@@ -599,7 +678,7 @@ async def _callback(update, context):
         else:
             store.resolve(identifier, retry=action == "retry_yes")
             await query.edit_message_reply_markup(reply_markup=None)
-            await context.bot.send_message(chat_id, "Post queued for retry." if action == "retry_yes" else "Post discarded; it will not be retried. Uncertain pool assets remain blocked; review Asset pool before reuse.")
+            await context.bot.send_message(chat_id, "Post queued for retry." if action == "retry_yes" else "Post discarded; it will not be retried.")
 
 
 def register_handlers(application: Application, owner_id: int) -> None:

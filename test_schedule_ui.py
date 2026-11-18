@@ -1,9 +1,10 @@
+import asyncio
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from telegram import Chat, MessageEntity, MessageOriginChannel
 
@@ -71,57 +72,60 @@ class ScheduleUITests(unittest.IsolatedAsyncioTestCase):
     def asset_status(self, aid):
         return self.store.db.execute('SELECT status FROM assets WHERE id=?', (aid,)).fetchone()[0]
 
-    async def begin_replacement(self):
-        old, new = self.asset(), self.asset(2, {**CONTENT, 'text': 'Replacement'})
+    async def begin_replacement(self, source_id=1, replacement_id=2):
+        old = self.asset(source_id)
         sid, post = self.schedule(old)
         await self.callback(f"post_replace:{post['id']}")
-        await self.message(forward_origin=self.origin(2), text='Forwarded')
-        return old, new, sid, post, self.context.user_data['replacement']['key']
+        await self.message(forward_origin=self.origin(replacement_id), text='Forwarded')
+        return old, sid, post, self.context.user_data['replacement']['key']
 
-    async def test_draft_forward_selects_full_album_and_preserves_received_caption(self):
-        album = {'kind': 'album', 'media': [
-            {'file_id': 'first', 'caption': 'Original first', 'caption_entities': []},
-            {'file_id': 'second', 'caption': 'Original second', 'caption_entities': []}]}
-        aid = self.asset(content=album, ids=[10, 20])
+    async def test_draft_forward_album_collects_only_forwarded_members(self):
         draft = self.draft()
         entity = MessageEntity('bold', 0, 3)
         message = await self.message(forward_origin=self.origin(20),
                                      photo=[SimpleNamespace(file_id='forwarded-second')],
-                                     caption='New caption', caption_entities=[entity])
+                                     caption='New caption', caption_entities=[entity],
+                                     media_group_id='forwarded-album')
         self.assertEqual(len(draft['posts']), 1)
-        selected = draft['posts'][0]
-        self.assertEqual(selected['asset_id'], aid)
-        self.assertEqual(selected['media'], [album['media'][0], {
-            'file_id': 'forwarded-second', 'caption': 'New caption',
-            'caption_entities': [entity.to_dict()]}])
-        self.assertEqual(self.store.asset_content(aid)['media'], album['media'])
-        self.assertEqual(self.asset_status(aid), 'available')
-        self.assertIn('Full album selected', message.reply_text.call_args.args[0])
+        self.assertIn('Receiving the album', message.reply_text.call_args.args[0])
         await self.message(forward_origin=self.origin(10),
-                           photo=[SimpleNamespace(file_id='first')])
-        self.assertEqual(len(draft['posts']), 1)
+                           photo=[SimpleNamespace(file_id='first')],
+                           media_group_id='forwarded-album')
+        await asyncio.sleep(1.6)
+        selected = draft['posts'][0]
+        self.assertEqual(selected['source'],
+                         {'chat_id': '-100', 'message_ids': [10, 20]})
+        self.assertEqual(selected['media'], [
+            {'file_id': 'first', 'caption': '', 'caption_entities': []},
+            {'file_id': 'forwarded-second', 'caption': 'New caption',
+             'caption_entities': [entity.to_dict()]}])
+        # No tracked source exists until Commit.
+        self.assertEqual(self.store.assets(), [])
+        with patch('bot._permission', new=AsyncMock(return_value=None)):
+            await self.callback('draft:draft-key:commit')
+        self.assertEqual(len(self.store.list_schedules()), 1)
+        aid = self.store.asset_from_source(-100, 10)['id']
+        self.assertEqual(self.asset_status(aid), 'pending')
+        self.assertEqual(self.store.get_posts(self.store.list_schedules()[0]['id'])[0]['content'],
+                         {k: v for k, v in selected.items() if k != 'source'})
 
-    async def test_replacement_forward_previews_complete_stored_album(self):
+    async def test_replacement_forward_previews_without_persisting_tracking(self):
         old = self.asset()
         _, post = self.schedule(old)
-        album = {'kind': 'album', 'media': [
-            {'file_id': 'first', 'caption': 'First'},
-            {'file_id': 'second', 'caption': 'Second'}]}
-        aid = self.asset(content=album, ids=[10, 20])
         await self.callback(f"post_replace:{post['id']}")
-        message = await self.message(forward_origin=self.origin(20))
+        message = await self.message(forward_origin=self.origin(20), text='Forwarded replacement')
         replacement = self.context.user_data['replacement']
-        self.assertEqual(replacement['asset_id'], aid)
-        media = self.bot.send_media_group.call_args.kwargs['media']
-        self.assertEqual([(item.media, item.caption) for item in media],
-                         [('first', 'First'), ('second', 'Second')])
+        self.assertEqual(replacement['source'],
+                         {'chat_id': '-100', 'message_ids': [20]})
+        self.assertEqual(replacement['content']['text'], 'Forwarded replacement')
+        self.assertIsNone(self.store.asset_from_source(-100, 20))
         self.assertEqual(self.buttons(message.reply_text.call_args.kwargs['reply_markup']), [[
-            ('Confirm replacement', f"replace_yes:{replacement['key']}:{aid}"),
+            ('Confirm replacement', f"replace_yes:{replacement['key']}"),
             ('Cancel', f"replace_cancel:{replacement['key']}")]])
-        self.assertEqual(self.asset_status(aid), 'available')
+        self.assertEqual(self.asset_status(old), 'pending')
 
     async def test_replacement_rejects_wrong_or_missing_source(self):
-        _, _, sid, post, _ = await self.begin_replacement()
+        _, sid, post, _ = await self.begin_replacement()
         replacement = dict(self.context.user_data['replacement'])
         self.bot.send_message.reset_mock()
         for origin in (self.origin(2, -999), None):
@@ -132,66 +136,90 @@ class ScheduleUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.store.get_posts(sid)[0], post)
         self.bot.send_message.assert_not_awaited()
 
-    async def test_replace_yes_preserves_slot_and_releases_old_asset(self):
-        old, new, sid, post, key = await self.begin_replacement()
-        query = await self.callback(f'replace_yes:{key}:{new}')
+    async def test_replacement_album_uses_only_forwarded_members(self):
+        old = self.asset()
+        sid, post = self.schedule(old)
+        await self.callback(f"post_replace:{post['id']}")
+        key = self.context.user_data['replacement']['key']
+        await self.message(forward_origin=self.origin(20), media_group_id='replacement-album',
+                           photo=[SimpleNamespace(file_id='forwarded-two')], caption='two')
+        await self.message(forward_origin=self.origin(10), media_group_id='replacement-album',
+                           photo=[SimpleNamespace(file_id='forwarded-one')], caption='one')
+        self.assertIsNone(self.store.asset_from_source(-100, 10))
+        await asyncio.sleep(1.6)
+        media = self.bot.send_media_group.call_args.kwargs['media']
+        self.assertEqual([(item.media, item.caption) for item in media],
+                         [('forwarded-one', 'one'), ('forwarded-two', 'two')])
+        self.assertIsNone(self.store.asset_from_source(-100, 10))
+        query = await self.callback(f'replace_yes:{key}')
+        result = self.store.get_posts(sid)[0]
+        new = self.store.asset_from_source(-100, 10)['id']
+        self.assertEqual(result['asset_id'], new)
+        self.assertEqual([item['file_id'] for item in result['content']['media']],
+                         ['forwarded-one', 'forwarded-two'])
+        self.assertEqual(self.asset_status(old), 'available')
+        query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+
+    async def test_replace_yes_preserves_slot_and_tracks_new_source(self):
+        old, sid, post, key = await self.begin_replacement()
+        query = await self.callback(f'replace_yes:{key}')
         result = self.store.get_posts(sid)[0]
         self.assertEqual((result['id'], result['due']), (post['id'], post['due']))
+        self.assertEqual(result['content']['text'], 'Forwarded')
+        new = self.store.asset_from_source(-100, 2)['id']
         self.assertEqual(result['asset_id'], new)
         self.assertEqual(self.asset_status(old), 'available')
         self.assertEqual(self.asset_status(new), 'pending')
         self.assertNotIn('replacement', self.context.user_data)
         query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
 
-    async def test_replace_yes_rechecks_asset_availability_after_preview(self):
-        old, new, sid, post, key = await self.begin_replacement()
-        self.schedule(new)
-        query = await self.callback(f'replace_yes:{key}:{new}')
+    async def test_replace_yes_rechecks_source_availability_after_preview(self):
+        old, sid, post, key = await self.begin_replacement()
+        self.store.create_schedule('-200', self.start, self.end, [
+            {k: v for k, v in CONTENT.items()}
+            | {'source': {'chat_id': '-100', 'message_ids': [2]}}])
+        query = await self.callback(f'replace_yes:{key}')
         self.assertEqual(self.store.get_posts(sid)[0], post)
         self.assertEqual(self.asset_status(old), 'pending')
         self.assertIn('replacement', self.context.user_data)
-        self.assertEqual(self.bot.send_message.call_args.args[1], 'Asset is no longer available.')
+        self.assertIn('already scheduled', self.bot.send_message.call_args.args[1])
         query.edit_message_reply_markup.assert_not_awaited()
 
     async def test_replace_yes_rechecks_post_pending_after_preview(self):
-        for status in ('sending', 'uncertain', 'failed'):
+        for index, status in enumerate(('sending', 'uncertain', 'failed')):
             with self.subTest(status=status):
-                old = self.asset(100 + len(self.store.list_schedules()))
-                new = self.asset(200 + len(self.store.list_schedules()))
-                sid, post = self.schedule(old)
-                self.context.user_data['replacement'] = {
-                    'post_id': post['id'], 'asset_id': new, 'key': status}
+                old, sid, post, key = await self.begin_replacement(
+                    100 + index, 200 + index)
                 self.store.hold(post['id'], status, 'test')
                 before = self.store.get_posts(sid)
-                await self.callback(f'replace_yes:{status}:{new}')
+                await self.callback(f'replace_yes:{key}')
                 self.assertEqual(self.store.get_posts(sid), before)
-                self.assertEqual(self.asset_status(new), 'available')
+                self.assertIsNone(self.store.asset_from_source(-100, 200 + index))
                 self.assertNotIn('replacement', self.context.user_data)
                 self.assertIn('no longer pending', self.bot.send_message.call_args.args[1])
 
     async def test_replacement_cancel_and_stale_key_do_not_mutate_post(self):
-        _, new, sid, post, key = await self.begin_replacement()
+        _, sid, post, key = await self.begin_replacement()
         replacement = dict(self.context.user_data['replacement'])
-        for action in ('replace_cancel:stale', f'replace_yes:stale:{new}'):
+        for action in ('replace_cancel:stale', 'replace_yes:stale'):
             query = await self.callback(action)
             self.assertEqual(self.context.user_data['replacement'], replacement)
             query.edit_message_reply_markup.assert_not_awaited()
         query = await self.callback(f'replace_cancel:{key}')
         self.assertNotIn('replacement', self.context.user_data)
         query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
-        await self.callback(f'replace_yes:{key}:{new}')
+        await self.callback(f'replace_yes:{key}')
         self.assertEqual(self.store.get_posts(sid)[0], post)
-        self.assertEqual(self.asset_status(new), 'available')
+        self.assertIsNone(self.store.asset_from_source(-100, 2))
 
-    async def test_replace_yes_rejects_superseded_preview(self):
-        _, new, sid, post, key = await self.begin_replacement()
-        latest = self.asset(3)
-        self.context.user_data['replacement']['asset_id'] = latest
-        query = await self.callback(f'replace_yes:{key}:{new}')
-        self.assertEqual(self.store.get_posts(sid)[0], post)
-        self.assertEqual(self.context.user_data['replacement']['asset_id'], latest)
-        self.assertEqual(self.bot.send_message.call_args.args[1], 'Use the latest replacement preview.')
-        query.edit_message_reply_markup.assert_not_awaited()
+    async def test_replacement_confirm_uses_latest_forward(self):
+        _, sid, post, key = await self.begin_replacement()
+        await self.message(forward_origin=self.origin(3), text='Latest')
+        query = await self.callback(f'replace_yes:{key}')
+        result = self.store.get_posts(sid)[0]
+        self.assertEqual(result['content']['text'], 'Latest')
+        self.assertEqual(self.store.asset_from_source(-100, 3)['status'], 'pending')
+        query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
 
     async def test_delete_confirmation_then_pending_only_deletion(self):
         aid = self.asset()

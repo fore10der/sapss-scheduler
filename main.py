@@ -133,7 +133,6 @@ async def startup(app):
 
 async def stop(app):
     tasks = [app.bot_data.get('worker'), app.bot_data.get('pool_worker')]
-    tasks.extend(p['task'] for p in app.bot_data.get('pool_groups', {}).values())
     for task in tasks:
         if task:
             task.cancel()
@@ -198,7 +197,7 @@ def main():
     app.bot_data.update(store=store, chat_id=destination, owner_id=owner,
                         pool_chat_id=int(pool_id) if pool_id else None)
     if pool_id and (str(destination) == str(int(pool_id))):
-        raise SystemExit('POOL_CHAT_ID must differ from CHAT_ID to avoid importing deliveries.')
+        raise SystemExit('POOL_CHAT_ID must differ from CHAT_ID to avoid treating deliveries as pool sources.')
     app.add_error_handler(application_error)
     register_handlers(app, owner)
     asyncio.set_event_loop(asyncio.new_event_loop())
