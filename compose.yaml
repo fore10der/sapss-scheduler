@@ -1,0 +1,15 @@
+services:
+  scheduler:
+    build: .
+    image: sapss-scheduler:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - scheduler-data:/app/data
+    ports:
+      # Only used in webhook mode. An external HTTPS reverse proxy forwards here.
+      - "${WEBHOOK_PORT:-8443}:${WEBHOOK_PORT:-8443}"
+
+volumes:
+  scheduler-data:

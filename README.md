@@ -32,6 +32,40 @@ Private, single-owner Python bot using the Telegram Bot API only. Supports text,
 
 4. Open a **private chat** with the bot and send `/start`.
 
+## Docker Compose
+
+`Dockerfile` and `compose.yaml` build and run one scheduler instance with standard Docker Compose; no hosting-provider tooling is required.
+
+```sh
+cp .env.example .env   # fill in BOT_TOKEN, OWNER_ID, CHAT_ID
+docker compose up -d --build
+```
+
+Compose passes the host `.env` to the process using `env_file`. `.env` is excluded from the build context and is never copied into the image, so credentials are not baked in. The container runs as a non-root user with working directory `/app`, preserving the default `DATABASE_PATH=data/scheduler.sqlite3`.
+
+The entire `/app/data` directory is the named volume `scheduler-data`. The database, its `.lock` file, and SQLite `-wal`/`-shm` sidecars survive container recreation and `docker compose down`. Run exactly one scheduler per database and bot token; the existing `flock` rejects a second process, so do not scale this service. Back up the volume while the container is stopped; it contains message content and media references.
+
+## Long polling and webhooks
+
+Mode selection is automatic, with no separate selector:
+
+- `WEBHOOK_URL` empty or unset: **long polling**. No public inbound endpoint is needed. Startup removes any previously registered webhook without dropping pending updates.
+- `WEBHOOK_URL` nonempty: **webhook mode**. Startup registers the public URL without dropping pending updates. Switching either direction therefore preserves pending updates.
+
+Both modes use the same configuration, handlers, subscribed update types (`message`, `callback_query`, `channel_post`, `edited_channel_post`), scheduler workers, and shutdown cleanup. See `.env.example` for the example block.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WEBHOOK_URL` | empty | Complete public HTTPS endpoint Telegram calls. Empty selects polling. |
+| `WEBHOOK_SECRET` | none | Required in webhook mode. 1-256 characters from `A-Z`, `a-z`, `0-9`, `_`, `-`. |
+| `WEBHOOK_HOST` | `0.0.0.0` | Local listener bind address. |
+| `WEBHOOK_PORT` | `8443` | Local listener port. |
+| `WEBHOOK_PATH` | `/webhook` | Local listener path; must match the path in `WEBHOOK_URL`. |
+
+The public endpoint and the listener are distinct. `WEBHOOK_URL` must use HTTPS on port `443`, `80`, `88`, or `8443` per Telegram limits. `WEBHOOK_HOST`/`WEBHOOK_PORT`/`WEBHOOK_PATH` configure the container's plain-HTTP listener; TLS termination, the public port, domain, certificate, and reverse proxy are external infrastructure and are not part of this project. Compose publishes `WEBHOOK_PORT` (default `8443`) for that external proxy; do not expose the listener directly to the internet. In polling mode the published port is unused and can be removed or firewalled off.
+
+`WEBHOOK_SECRET` is registered with Telegram and verified on every incoming request by the webhook server; missing or incorrect `X-Telegram-Bot-Api-Secret-Token` values are rejected with HTTP 403. Polling requires neither webhook variables nor a secret. Invalid webhook configuration (non-HTTPS URL, unsupported public port, path mismatch, bad secret, invalid listener values) exits at startup with a specific error before the database is opened.
+
 ## Workflow
 
 - **Create schedule** → enter start, then end as `YYYY-MM-DD HH:mm`.
@@ -128,4 +162,4 @@ Pool album collection uses the same 1.5-second inactivity heuristic as drafts, i
 .venv/bin/python -m unittest -v
 ```
 
-Tests cover spacing, commit validation, queue claiming, restart recovery, deletion during delivery, uncertain transport failures, metadata-only UTC logs/private reports, success removal before reporting, and report failures without duplicate sends. Live Telegram testing requires your credentials and destination.
+Tests cover spacing, commit validation, queue claiming, restart recovery, deletion during delivery, uncertain transport failures, metadata-only UTC logs/private reports, success removal before reporting, report failures without duplicate sends, webhook/polling mode selection, webhook configuration validation, secret-token rejection, and second-instance database locking. Live Telegram testing requires your credentials and destination.

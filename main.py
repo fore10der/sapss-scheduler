@@ -12,10 +12,13 @@ from telegram.error import BadRequest, Forbidden, RetryAfter
 from telegram.ext import Application, BaseRateLimiter
 
 from bot import register_handlers, send_content
+from config import webhook_config
 from error_reporting import application_error
 from storage import Store
 
 log = logging.getLogger(__name__)
+
+ALLOWED_UPDATES = ('message', 'callback_query', 'channel_post', 'edited_channel_post')
 
 
 def delivery_details(post, attempted_at, result):
@@ -142,6 +145,31 @@ async def stop(app):
                 pass
 
 
+def open_database_lock(path):
+    """Create the sibling lock file and take the process-wide scheduler lock."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock = open(str(path) + '.lock', 'a')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        raise SystemExit('Another scheduler is already using this database.') from None
+    return lock
+
+
+def run_application(app, webhook):
+    """Run one mode. An empty WEBHOOK_URL means polling; otherwise webhooks."""
+    if webhook is None:
+        log.info('Starting long polling: WEBHOOK_URL is empty')
+        app.run_polling(drop_pending_updates=False, allowed_updates=list(ALLOWED_UPDATES))
+        return
+    log.info('Starting webhook listener host=%s port=%s path=%s url=%s',
+             webhook.host, webhook.port, webhook.path, webhook.url)
+    app.run_webhook(listen=webhook.host, port=webhook.port, url_path=webhook.path,
+                    webhook_url=webhook.url, secret_token=webhook.secret,
+                    drop_pending_updates=False, allowed_updates=list(ALLOWED_UPDATES))
+
+
 def main():
     load_dotenv(Path(__file__).resolve().parent / '.env', override=False)
     logging.Formatter.converter = time.gmtime
@@ -149,19 +177,17 @@ def main():
                         format='%(asctime)sZ %(levelname)s %(name)s %(message)s',
                         datefmt='%Y-%m-%dT%H:%M:%S')
     logging.getLogger('httpx').setLevel(logging.WARNING)
+    try:
+        webhook = webhook_config(os.environ)
+    except ValueError as exc:
+        raise SystemExit(f'Invalid webhook configuration: {exc}') from None
     token = os.environ['BOT_TOKEN']
     owner = int(os.environ['OWNER_ID'])
     destination = os.environ['CHAT_ID']
     destination = int(destination) if destination.lstrip('-').isdigit() else destination
     path = Path(os.environ.get('DATABASE_PATH', 'data/scheduler.sqlite3'))
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Recovery must not mark another live worker's requests as uncertain.
-    lock = open(str(path) + '.lock', 'a')
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock.close()
-        raise SystemExit('Another scheduler is already using this database.')
+    lock = open_database_lock(path)
     store = Store(path)
     path.chmod(0o600)
     from rate_limiter import TelegramRateLimiter
@@ -177,8 +203,7 @@ def main():
     register_handlers(app, owner)
     asyncio.set_event_loop(asyncio.new_event_loop())
     try:
-        app.run_polling(drop_pending_updates=False,
-                        allowed_updates=['message', 'callback_query', 'channel_post', 'edited_channel_post'])
+        run_application(app, webhook)
     finally:
         store.close()
         lock.close()
