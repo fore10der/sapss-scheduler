@@ -365,6 +365,23 @@ async def _message(update, context):
             await message.reply_text('Only text and photos are supported.')
             return
         gid = message.media_group_id
+        if gid is not None and gid in replacement.get('rejected_albums', ()):
+            await message.reply_text(
+                'This forwarded album includes a pool source already published by this '
+                'scheduler; the album cannot be used as a replacement.')
+            return
+        store = context.application.bot_data["store"]
+        if store.published_source_ids(str(origin.chat.id), [origin.message_id]):
+            if gid is not None:
+                replacement.setdefault('rejected_albums', set()).add(gid)
+            _cancel_replacement_pending(replacement)
+            replacement['content'] = None
+            replacement['source'] = None
+            await message.reply_text(
+                'This pool source was already published by this scheduler; it cannot be '
+                'used as a replacement.' + (
+                    ' The forwarded album was not added.' if gid is not None else ''))
+            return
         if gid is not None:
             if incoming['kind'] != 'photo':
                 await message.reply_text('Only photo albums are supported.')
@@ -439,10 +456,34 @@ async def _message(update, context):
             await message.reply_text('Not added: only text and photos are supported.')
             return
         source_chat = str(origin.chat.id)
+        if gid is not None and gid in draft.get('rejected_albums', ()):
+            await message.reply_text(
+                'Not added: this forwarded album includes a pool source already published '
+                'by this scheduler.')
+            return
         if pending is not None and 'source_chat' not in pending:
             await message.reply_text(
                 'Not added: this album already contains standalone uploads. '
                 'Cancel the draft album before mixing forwarded pool posts.')
+            return
+        store = context.application.bot_data["store"]
+        if store.published_source_ids(source_chat, [origin.message_id]):
+            if gid is not None:
+                draft.setdefault('rejected_albums', set()).add(gid)
+            discard = list(draft.get('album_posts', {}).pop(gid, [])) if gid is not None else []
+            if pending is not None:
+                pending['task'].cancel()
+                draft['pending'].pop(gid, None)
+                if pending['post'] not in discard:
+                    discard.append(pending['post'])
+            for post in discard:
+                if post in draft['posts']:
+                    draft['posts'].remove(post)
+            await message.reply_text(
+                'Not added: this pool source was already published by this scheduler. '
+                + ('The forwarded album was not added.' if gid is not None
+                   else 'Choose an unpublished original.'))
+            await _summary(context, chat_id)
             return
         if pending is not None:
             if incoming['kind'] != 'photo':
@@ -467,6 +508,7 @@ async def _message(update, context):
                 return
             post = {"kind": "album", "text": "", "entities": [], "media": []}
             draft['posts'].append(post)
+            draft.setdefault('album_posts', {}).setdefault(gid, []).append(post)
             pending = {"post": post, "items": {origin.message_id: incoming['media'][0]},
                        "source_chat": source_chat}
             draft['pending'][gid] = pending

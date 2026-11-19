@@ -1,4 +1,4 @@
-"""SQLite queue. Successful deliveries leave no post history."""
+"""SQLite queue with durable pool-source publication history."""
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -44,6 +44,10 @@ class Store:
             UNIQUE(source_chat, source_ids));
         CREATE UNIQUE INDEX IF NOT EXISTS asset_groups ON assets(source_chat, group_id)
             WHERE group_id IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS published_sources (
+            source_chat TEXT NOT NULL, source_id INTEGER NOT NULL,
+            asset_id INTEGER, published_at TEXT,
+            PRIMARY KEY(source_chat, source_id));
         ''')
         self.db.executescript('''
         CREATE TABLE IF NOT EXISTS asset_originals (
@@ -93,6 +97,15 @@ class Store:
         END;
         ''')
         with self.db:
+            # Existing successful records are the only available historical evidence.
+            # Backfill once per source; later resets cannot remove these rows.
+            for asset in self.db.execute(
+                    "SELECT id,source_chat,source_ids,stamp FROM assets WHERE status='published'"):
+                for source_id in json.loads(asset['source_ids']):
+                    self.db.execute('''INSERT OR IGNORE INTO published_sources
+                        (source_chat,source_id,asset_id,published_at) VALUES(?,?,?,?)''',
+                        (asset['source_chat'], int(source_id), asset['id'],
+                         asset['stamp'] or datetime.now(UTC).isoformat()))
             # Legacy databases have no event sequence. Seed deterministically once;
             # subsequent transitions use the trigger, independent of wall-clock changes.
             self.db.execute('''INSERT INTO asset_status_order(asset_id)
@@ -121,17 +134,41 @@ class Store:
                       'message_ids': post.pop('source_ids')}
         return source
 
+    def published_source_ids(self, source_chat, source_ids):
+        """Return which source IDs in this channel already have confirmed publication."""
+        ids = sorted({int(value) for value in source_ids})
+        if not ids:
+            return set()
+        placeholders = ','.join('?' for _ in ids)
+        return {row[0] for row in self.db.execute(
+            f'SELECT source_id FROM published_sources '
+            f'WHERE source_chat=? AND source_id IN ({placeholders})',
+            (str(source_chat), *ids))}
+
+    def _reject_published(self, source_chat, source_ids):
+        if self.published_source_ids(source_chat, source_ids):
+            raise ValueError(
+                'This pool source was already published by this scheduler '
+                'and cannot be scheduled again.')
+
+    def _reject_published_asset(self, asset_id):
+        row = self.db.execute(
+            'SELECT source_chat,source_ids FROM assets WHERE id=?', (asset_id,)).fetchone()
+        if row is not None:
+            self._reject_published(row['source_chat'], json.loads(row['source_ids']))
+
     def _claim_source(self, source_chat, source_ids, content, due, post_id=None):
         """Create or reuse one tracked source record and reserve it as pending.
 
         Only Commit and confirmed replacements call this; drafts and previews
-        remain in memory. Raises ValueError when the same pool source already
-        belongs to another queue entry.
+        remain in memory. Raises ValueError when any source ID was already
+        published by this scheduler or the source belongs to another queue entry.
         """
         ids = sorted({int(value) for value in source_ids})
         if not ids:
             raise ValueError('Forwarded pool source is missing message IDs.')
         source_chat = str(source_chat)
+        self._reject_published(source_chat, ids)
         snapshot = self._snapshot(content)
         row = self.db.execute(
             'SELECT * FROM assets WHERE source_chat=? AND source_ids=?',
@@ -181,6 +218,7 @@ class Store:
                     except (KeyError, TypeError):
                         raise ValueError('Forwarded pool source is incomplete.') from None
                 elif aid is not None:
+                    self._reject_published_asset(aid)
                     changed = self.db.execute("UPDATE assets SET status='pending',stamp=?,status_reason=NULL,dirty=1,revision=revision+1 WHERE id=? AND status='available' AND content IS NOT NULL",
                                               (t.isoformat(), aid)).rowcount
                     if not changed:
@@ -237,6 +275,7 @@ class Store:
                     self._asset_status(aid, 'pending', row['due'], reason='replacement')
             if aid != row['asset_id']:
                 if aid is not None and source is None:
+                    self._reject_published_asset(aid)
                     changed = self.db.execute("""UPDATE assets SET status='pending',stamp=?,
                         status_reason='replacement',dirty=1,revision=revision+1
                         WHERE id=? AND status='available' AND content IS NOT NULL""",
@@ -296,6 +335,12 @@ class Store:
             row = self.db.execute("DELETE FROM posts WHERE id=? AND status='sending' RETURNING asset_id", (post_id,)).fetchone()
             if row:
                 asset = self.db.execute('SELECT * FROM assets WHERE id=?', (row['asset_id'],)).fetchone()
+                published_at = datetime.now(UTC).isoformat()
+                if asset:
+                    for source_id in json.loads(asset['source_ids']):
+                        self.db.execute('''INSERT OR IGNORE INTO published_sources
+                            (source_chat,source_id,asset_id,published_at) VALUES(?,?,?,?)''',
+                            (asset['source_chat'], int(source_id), asset['id'], published_at))
                 if asset and asset['content']:
                     original = json.loads(asset['content'])
                     for index, source_id in enumerate(json.loads(asset['source_ids'])):
@@ -305,7 +350,7 @@ class Store:
                         self.db.execute('''INSERT OR IGNORE INTO pool_mark_jobs
                             (asset_id,source_id,kind,payload) VALUES(?,?,?,?)''',
                             (asset['id'], source_id, kind, json.dumps(payload)))
-                self._asset_status(row['asset_id'], 'published', datetime.now(UTC).isoformat())
+                self._asset_status(row['asset_id'], 'published', published_at)
                 self.db.execute("UPDATE assets SET content=NULL WHERE id=?", (row['asset_id'],))
             self._cleanup()
 
